@@ -54,6 +54,13 @@
       "legend": "Ezreal, Prodigal Explorer",
       "label": "Ezreal (Post Ban)",
       "_source": "https://piltoverarchive.com/decks/view/8452ee7d-0239-4847-845c-de74d28a2547"
+    },
+    {
+      "file": "heron-ivern.txt",
+      "legend": "Ivern, Green Father",
+      "label": "Heron Ivern",
+      "_comment": "No sideboard on Piltover Archive — the list is 40 cards with an empty board.",
+      "_source": "https://piltoverarchive.com/decks/view/cf858562-c88e-4ec6-8318-ee9f764ccd8c"
     }
   ]
 }
