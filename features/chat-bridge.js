@@ -482,6 +482,13 @@ export function initChatBridge(app, io, opts = {}) {
         pendingPrompts: pending.size(),
         queued: [...waiting.entries()].map(([p, e]) => ({ platform: p, card: e.card.name, waitingMs: Date.now() - e.at })),
         lastServedPlatform,
+        // What !decklists would say right now, without posting to chat — so it
+        // can be checked from here before anyone relies on it. reply:null means
+        // it would stay quiet (see describeOnAir).
+        decklists: (() => {
+            try { return { programScene: getCurrentProgramScene(), reply: describe() }; }
+            catch (e) { return { error: e && e.message }; }
+        })(),
     }));
 
     // Kill switch — flip without restarting the server mid-show.

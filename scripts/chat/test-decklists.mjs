@@ -217,5 +217,21 @@ b = initChatBridge(app, ioCards, { connect: false, cooldownMs: 0, dwellMs: 60000
 b.handle({ platform: 'twitch', userId: 'u-x', login: 'x', displayName: 'x', text: '!decks [[Loose Cannon]]' });
 check('REVIEW: "!decks [[card]]" puts the card on air', shown.length === 1 && /Loose Cannon/.test(shown[0]), JSON.stringify(shown));
 
+// ── 8. the status page previews the reply without posting ──────────────────
+let statusHandler = null;
+const s8 = [];
+initChatBridge({ get(path, h) { if (path.endsWith('/status')) statusHandler = h; }, post() {} }, io,
+    { connect: false, say: async (t) => { s8.push(t); }, describeOnAir: describe });
+let status = null;
+statusHandler({}, { json: (o) => { status = o; } });
+check('status page previews what !decklists would say',
+    status?.decklists?.reply === 'Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc)', JSON.stringify(status?.decklists));
+check('the preview posts nothing to chat', s8.length === 0);
+statusHandler = null;
+initChatBridge({ get(path, h) { if (path.endsWith('/status')) statusHandler = h; }, post() {} }, io,
+    { connect: false, say: async () => {}, describeOnAir: () => { throw new Error('boom'); } });
+statusHandler({}, { json: (o) => { status = o; } });
+check('a failing read cannot break the status page', status?.decklists?.error === 'boom', JSON.stringify(status?.decklists));
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
