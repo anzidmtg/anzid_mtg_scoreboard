@@ -20,9 +20,19 @@
 // Reading uses anonymous IRC (features/chat/twitch-irc.js). Sending prompts is
 // injected as `say` so this module stays testable and works read-only when no
 // Twitch credentials are configured.
+//
+//   viewer:  !decklists
+//   bot:     @viewer Match 1: justmilkey (Jayce) vs Blank (LeBlanc)
+//
+// A chat reply only — it never touches anything on air. It answers for the
+// match OBS has on program, reading the same data that match's header is
+// showing, and only once that header has been sent this server's data since
+// boot. Anything it can't vouch for, it says nothing about.
 
 import { emitCardView } from './cards.js';
-import { getGameSelection } from '../config/constants.js';
+import { getGameSelection, getPlayerCount } from '../config/constants.js';
+import { getControlsTracker, getControlData, getBroadcastTracker, isScoreboardInSync } from './control.js';
+import { getCurrentProgramScene } from './obs-websocket.js';
 import { connectTwitchChat } from './chat/twitch-irc.js';
 import { connectYouTubeChat } from './chat/youtube-live.js';
 import { resolveCardName } from './chat/resolve.js';
@@ -42,7 +52,24 @@ const DEFAULTS = {
     maxPerStream: 200,      // hard ceiling for one session
     announceCooldown: true, // reply once per cooldown window, not per request
     maxHoldMs: 30000,       // drop a queued request older than this
+    // !decklists answers everyone at once, so one reply per window is plenty —
+    // the matchup changes between games, not between chat messages. Requests
+    // inside the window are dropped silently: a raid gets one answer, not 200.
+    decklistsCooldownMs: 30000,
 };
+
+// What each match's on-air header renders, per the scene collection on the box
+// (checked 2026-09-20). This table is the whole contract — if the OBS wiring
+// changes, change it here:
+//   "Match 1 …" scenes -> /scoreboard/match1                 = Control 1
+//   "Match 2 …" scenes -> /broadcast/round/scoreboard/match2 = the Broadcast round's match2
+// Note Match 2 is NOT Control 2: nothing Control-2-driven is enabled on air.
+const ON_AIR = [
+    { label: 'Match 1', scene: /\bmatch\s*1\b/i, from: 'control', control: '1' },
+    { label: 'Match 2', scene: /\bmatch\s*2\b/i, from: 'broadcast', match: 'match2' },
+];
+// Twitch rejects messages over 500 characters; leave room for the @mention.
+const MAX_REPLY = 450;
 
 const log = (m) => console.log(`[chat-bridge] ${m}`);
 
@@ -54,6 +81,111 @@ function parseCommand(text) {
     const brackets = s.match(/\[\[\s*(.{2,80}?)\s*\]\]/);
     if (brackets) return brackets[1].trim();
     return null;
+}
+
+// "!decklists" | "!decklist" | "!decks" — the bare command only. Anything after
+// it means the line is something else ("!decks [[kennen]]" is a card request),
+// so it falls through to parseCommand untouched.
+function isDecklistsCommand(text) {
+    return /^!(?:decklists?|decks)$/i.test(String(text ?? '').trim());
+}
+
+// Scoreboard names are edited in a contenteditable field, so they arrive as
+// HTML — "Asc Samdsherman&nbsp;" is real data from the box. Chat is plain text
+// and one line shared by every name, so beyond decoding entities and dropping
+// markup, remove anything that reaches past its own name: control and
+// bidi/format characters (an RLO reverses the rest of the line) and square
+// brackets (the card command's syntax — the bot hears its own lines).
+const ENTITIES = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+function codePoint(n) {
+    return Number.isInteger(n) && n > 0 && n <= 0x10FFFF && !(n >= 0xD800 && n <= 0xDFFF)
+        ? String.fromCodePoint(n) : ' ';
+}
+function plainText(v) {
+    return String(v ?? '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&(#x[0-9a-f]+|#\d+|[a-z0-9]+);/gi, (m, e) => {
+            const k = e.toLowerCase();
+            if (k.startsWith('#x')) return codePoint(parseInt(k.slice(2), 16));
+            if (k.startsWith('#')) return codePoint(parseInt(k.slice(1), 10));
+            return ENTITIES[k] ?? m;
+        })
+        .replace(/\p{Cc}/gu, ' ')
+        .replace(/[\p{Cf}\p{Cs}[\]]/gu, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        // By code point, so a long name can't be cut through an emoji.
+        .replace(/^(.{40})[\s\S]+$/u, '$1')
+        .trim();
+}
+
+// "Rengar, Pridestalker" -> "Rengar": the champion is how chat talks about a
+// deck, and the full title doubles the length of every reply.
+function shortLegend(legend) {
+    return plainText(String(legend ?? '').split(',')[0]);
+}
+
+// One match, never saying more than its header shows. Decks only where the
+// page renders one — Riftbound legends and MTG archetypes, 1v1. In 2v2 the
+// partner decks are hidden (MTG 2v2 hides the whole row); FFA seats are drawn
+// four-up; other games show leader/base rather than an archetype. All of
+// those get names only. The "-2" slots are read only in 2v2/FFA: in 1v1 they
+// hold whatever was typed the last time the show ran 2v2.
+function describeMatch(d, game, playerCount) {
+    const name = (slot) => plainText(d[`player-name-${slot}`]);
+    if (playerCount === 'ffa') {
+        const seats = ['left', 'left-2', 'right', 'right-2'].map(name).filter(Boolean);
+        return seats.length >= 2 ? seats.join(', ') : null;
+    }
+    if (playerCount === '2v2') {
+        const team = (a, b) => [name(a), name(b)].filter(Boolean).join(' & ');
+        const l = team('left', 'left-2'), r = team('right', 'right-2');
+        return l && r ? `${l} vs ${r}` : null;
+    }
+    const decks = playerCount === '1v1' && (game === 'riftbound' || game === 'mtg');
+    const player = (slot) => {
+        const n = name(slot);
+        if (!n || !decks) return n;
+        const deck = game === 'riftbound'
+            ? shortLegend(d[`player-legend-${slot}`])
+            : plainText(d[`player-archetype-${slot}`]);
+        return deck ? `${n} (${deck})` : n;
+    };
+    // Somebody has to be named on BOTH sides — half a pairing is setup in
+    // progress, not something to announce.
+    const l = player('left'), r = player('right');
+    return l && r ? `${l} vs ${r}` : null;
+}
+
+// The reply for whatever is on air, or null when that can't be known: the OBS
+// link is down, or the on-air header hasn't been sent this server's data since
+// boot (after a restart it goes on showing the old show). null = stay quiet
+// rather than guess.
+export function describeOnAir({
+    scene = getCurrentProgramScene(),
+    tracker = getControlsTracker(), broadcast = getBroadcastTracker(),
+    data = getControlData(), inSync = isScoreboardInSync,
+    game = getGameSelection(), playerCount = getPlayerCount(),
+} = {}) {
+    if (!scene) return null;
+    const live = ON_AIR.filter(m => m.scene.test(scene));
+    if (!live.length) return 'no match is on air right now.';
+    const lines = [], said = new Set();
+    for (const m of live) {
+        let d;
+        if (m.from === 'control') {
+            if (!inSync(m.control)) return null;
+            const { round_id, match_id } = tracker?.[m.control] || {};
+            d = data?.[round_id]?.[match_id];
+        } else {
+            const round_id = broadcast?.round_id;
+            if (round_id == null) return null;       // nothing broadcast since boot
+            d = data?.[round_id]?.[m.match];
+        }
+        const text = d && describeMatch(d, game, playerCount);
+        if (text && !said.has(text)) { said.add(text); lines.push(`${m.label}: ${text}`); }
+    }
+    return lines.length ? lines.join(' | ') : "the players aren't on the scoreboard yet.";
 }
 
 export function initChatBridge(app, io, opts = {}) {
@@ -85,6 +217,31 @@ export function initChatBridge(app, io, opts = {}) {
     }
     let lastShownAt = 0, shownThisStream = 0, live = true;
     let lastCooldownNoticeAt = 0;
+    let lastDecklistsAt = 0;
+    const describe = opts.describeOnAir || (() => describeOnAir());
+    const botLogin = String(opts.botLogin ?? process.env.TWITCH_BOT_LOGIN ?? '').trim().toLowerCase();
+
+    function answerDecklists(msg) {
+        // Nothing to do where we can't post (YouTube is read-only), and brand
+        // new accounts are ignored exactly as they are for !card.
+        if (!canPromptOn(msg.platform) || msg.firstMsg) return;
+        if (Date.now() - lastDecklistsAt < cfg.decklistsCooldownMs) return;
+        // Read BEFORE spending the window, so a read that throws leaves the
+        // next viewer free to ask. "Can't tell" still spends it: during a raid
+        // that is one quiet check per window, not one per message.
+        const body = describe();
+        lastDecklistsAt = Date.now();
+        if (!body) {
+            log("decklists: staying quiet — can't confirm what is on air (OBS link down, or nothing sent to that scoreboard since the server started)");
+            return;
+        }
+        // Cut by code point: a UTF-16 slice can split an emoji and send a lone
+        // surrogate to Twitch.
+        const chars = Array.from(body);
+        const text = chars.length > MAX_REPLY ? `${chars.slice(0, MAX_REPLY - 1).join('')}…` : body;
+        log(`decklists for ${msg.displayName}: ${text}`);
+        say(`@${msg.displayName} ${text}`).catch(() => {});
+    }
 
     // ── Cross-platform fairness ──────────────────────────────────────────────
     // The cooldown is global, so whoever lands first takes the slot and locks
@@ -210,12 +367,21 @@ export function initChatBridge(app, io, opts = {}) {
         if (!live) return;
         if (!msg || typeof msg !== 'object') return;
         if (typeof msg.text !== 'string' || !msg.userId) return;
+        // The IRC reader is anonymous, so it hears the bot's own messages too.
+        // Those are never requests — and a !decklists reply carries scoreboard
+        // text, which must not be able to put a card on air.
+        if (botLogin && String(msg.login || '').toLowerCase() === botLogin) return;
         // A bare number resolves this user's own open prompt, and is never
         // treated as a card name.
         // Key by platform+id: a Twitch id and a YouTube id could otherwise
         // collide and let one viewer resolve another's prompt.
         const key = `${msg.platform}:${msg.userId}`;
         if (pending.tryPick(key, msg.text)) return;
+
+        // Checked before the card command, and deliberately leaves this
+        // viewer's open card prompt alone — asking who's playing is not a new
+        // card request.
+        if (isDecklistsCommand(msg.text)) { answerDecklists(msg); return; }
 
         const query = parseCommand(msg.text);
         if (!query) return;
@@ -336,4 +502,4 @@ export function initChatBridge(app, io, opts = {}) {
     };
 }
 
-export const _internal = { parseCommand };
+export const _internal = { parseCommand, isDecklistsCommand, plainText, shortLegend, describeMatch, ON_AIR };

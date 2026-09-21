@@ -44,6 +44,15 @@ let battlefieldVisibility = {
     'right-2': true
 };
 
+// Which Live scoreboards have been sent this server's data since it booted.
+// After a restart the OBS pages rejoin their rooms but go on showing the old
+// show until the server next pushes to them, so until then the server's state
+// is not what's on screen. The chat bot's !decklists relies on this: it must
+// never describe a match that isn't what viewers are looking at.
+const scoreboardsPushedSinceBoot = new Set();
+export function noteScoreboardPushed(control_id) { scoreboardsPushedSinceBoot.add(String(control_id)); }
+export function isScoreboardInSync(control_id) { return scoreboardsPushedSinceBoot.has(String(control_id)); }
+
 
 // Load control data from file
 export async function loadControlData() {
@@ -167,6 +176,7 @@ export async function updateFromControl(round_id, match_id, newState, io) {
 
     Object.entries(controlsTracker).forEach(([control_id, control]) => {
         if (control.round_id === round_id && control.match_id === match_id) {
+            noteScoreboardPushed(control_id);
             RoomUtils.emitToRoom(io, `scoreboard-${control_id}`, `scoreboard-${control_id}-saved-state`, {
                 data: controlData[round_id][match_id],
                 round_id,
@@ -206,6 +216,7 @@ export async function updateFieldFromControl(round_id, match_id, field, value, t
         // Also emit full state to scoreboard(s) tracking this round/match
         Object.entries(controlsTracker).forEach(([control_id, control]) => {
             if (control.round_id === round_id && control.match_id === match_id) {
+                noteScoreboardPushed(control_id);
                 RoomUtils.emitToRoom(io, `scoreboard-${control_id}`, `scoreboard-${control_id}-saved-state`, {
                     data: controlData[round_id][match_id],
                     round_id,
@@ -230,6 +241,7 @@ export function emitSavedStateForControl(control_id, io) {
         match_id,
         archetypeList: getSortedArchetypes()
     });
+    noteScoreboardPushed(control_id);
     RoomUtils.emitToRoom(io, `scoreboard-${control_id}`, `scoreboard-${control_id}-saved-state`, {
         data: controlData[round_id]?.[match_id] || {},
         round_id,
@@ -248,6 +260,7 @@ export function updateControlMapping(controlId, round_id, match_id, io) {
         match_id,
         archetypeList: getSortedArchetypes()
     });
+    noteScoreboardPushed(controlId);
     RoomUtils.emitToRoom(io, `scoreboard-${controlId}`, `scoreboard-${controlId}-saved-state`, {
         data: controlData[round_id]?.[match_id] || {},
         round_id,
@@ -307,6 +320,7 @@ export async function updateFromMaster(allControlData, io) {
                         match_id,
                         archetypeList: getSortedArchetypes()
                     });
+                    noteScoreboardPushed(control_id);
                     RoomUtils.emitToRoom(io, `scoreboard-${control_id}`, `scoreboard-${control_id}-saved-state`, {
                         data: mergedData,
                         round_id,

@@ -60,6 +60,14 @@ let reconnectTimer = null;
 let wasOnStandings = false;
 let lastProgramScene = null;
 
+// What OBS has on program right now, for anything that needs to know what
+// viewers are watching (the chat bot's !decklists). Kept apart from
+// lastProgramScene on purpose: that one drives the stinger and animation
+// timing and must only move on a real scene change, whereas this is also read
+// at connect and cleared when the link drops. null = not known.
+let currentProgramScene = null;
+export function getCurrentProgramScene() { return currentProgramScene; }
+
 // Standings leave-reset delay (off-screen, ms). Kept fixed on purpose — it's
 // about when to reset the standings data AFTER cutting away, not an entrance.
 const STANDINGS_DELAY = 2000;
@@ -190,6 +198,7 @@ let cachedVideoFps = 60;
 let transitionKindByName = {};
 
 function handleSceneChange(sceneName, transitionInfo = null) {
+    currentProgramScene = sceneName;
     if (sceneName === lastProgramScene) return;
     // Capture the FROM scene before we overwrite lastProgramScene — the
     // schedule-delay branch below needs to know what we're transitioning
@@ -1003,6 +1012,15 @@ async function connect() {
         await obs.connect(OBS_WS_URL, OBS_WS_PASSWORD);
         log('[OBS WebSocket] Connected');
 
+        // Scene changes only arrive as events, so without this the program
+        // scene would be unknown until the operator's first cut after boot.
+        try {
+            const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
+            currentProgramScene = currentProgramSceneName || null;
+        } catch (err) {
+            log(`[OBS WebSocket] Could not read the program scene: ${err.message}`);
+        }
+
         // Cache the project FPS once at connect — used by
         // computeScheduleDelay to convert frame-based stinger
         // transition_points to ms. Refresh isn't critical (fps rarely
@@ -1094,6 +1112,7 @@ async function connect() {
         });
 
         obs.on('ConnectionClosed', () => {
+            currentProgramScene = null;   // can't vouch for what's on air while blind
             log('[OBS WebSocket] Connection closed — reconnecting...');
             scheduleReconnect();
         });

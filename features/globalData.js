@@ -1,4 +1,4 @@
-import {getControlData, emitControlData, saveControlData, getControlsTracker} from './control.js';
+import {getControlData, emitControlData, saveControlData, getControlsTracker, noteScoreboardPushed} from './control.js';
 import {getSortedArchetypes} from './archetypes.js';
 import {DEFAULT_INITIAL_TIME, getInitialTime, setInitialTime} from "../config/constants.js";
 import { RoomUtils } from '../utils/room-utils.js';
@@ -103,6 +103,7 @@ export async function updateEventInformation(eventInfo, io, timerState) {
                         match_id,
                         archetypeList: getSortedArchetypes()
                     });
+                    noteScoreboardPushed(control_id);
                     RoomUtils.emitToRoom(io, `scoreboard-${control_id}`, `scoreboard-${control_id}-saved-state`, {
                         data: matchData,
                         round_id,
