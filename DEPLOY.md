@@ -174,6 +174,35 @@ sent there: the answer arrives on a poll, long after the 5-second window.
    "Top chat" to "Live chat". A message the API accepted can still be filtered
    out for everyone else, and the API reports success either way.
 
+**Testing it without going live.** In order, cheapest first:
+
+| | |
+|---|---|
+| `node scripts/chat/test-decklists.mjs` | 266 checks, no network, no quota. Message fitting, the 200-char refusal, every quota cap, the read pacing. |
+| `node scripts/chat/fake-youtube.mjs` | A fake YouTube on localhost driving the REAL reader, bridge and OAuth sender. Watch a viewer's `!decklists` produce a real posted message. `--scenario ended` proves it picks up the next broadcast without a restart; `--scenario quota` and `--scenario expired` show what those look like. |
+| `node scripts/chat/youtube-check.mjs --server http://<box>:1378` | The live server's quota, and the exact message a YouTube reply would post right now. |
+| An **unlisted** live stream | The only way to test the four things nothing local can settle. |
+
+Unlisted, not private: an API key has no identity, so a private video is
+invisible to the reader. A scheduled-but-not-started broadcast is no good
+either — `activeLiveChatId` exists only while actually live. And `search.list`
+cannot find an unlisted stream, so a test must pin `YOUTUBE_VIDEO_ID` rather
+than rely on channel discovery.
+
+Test on the channel that **airs the show**, not a spare one: the filters that
+eat bot messages (held messages, blocked words, slow mode, subscriber-only) are
+channel settings, not stream settings. Colour bars at a low bitrate are a
+perfectly valid stream; the yellow stream-health warning is expected. An
+unlisted stream is not in search or subscriber feeds.
+
+Then `node scripts/chat/youtube-check.mjs --video <id> --send-test` posts one
+message **with a link in it** and tells you to check from a second account on
+"Live chat" rather than "Top chat". The whole test costs about 53 units.
+
+What only a real stream can settle: how YouTube counts its 200 characters,
+whether a moderator's links survive chat filtering, whether the refresh token
+outlives its 7 days, and whether Google's quota count matches ours.
+
 **Quota, honestly.** A reply costs 50 units from the same 10,000 a day reading
 spends. The bot holds itself to 2,000 units of replies a day (40 messages), at
 most 8 an hour, and answers `!decklists` on YouTube once every 15 minutes. Past

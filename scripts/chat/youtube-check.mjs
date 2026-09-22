@@ -180,9 +180,14 @@ if (process.argv.includes('--send-test')) {
             if (!warm.ok) { bad(`the bot could not authenticate: ${warm.reason}`); note('If it mentions invalid_grant, the Cloud app is probably still in "Testing" — publish it and re-run youtube-auth.mjs.'); }
             else {
                 ok(`authenticated as channel ${warm.botChannelId}`);
-                const r = await sender.say('anzidbot check — you can ignore this.');
+                // It must carry a LINK. A plain sentence posts fine even when
+                // the channel's filtering would eat every real reply — which
+                // is the one failure this test exists to catch.
+                const doc = (process.env.DECKLISTS_DOC_URL || 'https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ').trim();
+                const testMessage = `anzidbot check — ignore. All lists here: ${doc}`;
+                const r = await sender.say(testMessage);
                 if (r.ok) {
-                    ok('posted a test message (50 units)');
+                    ok(`posted a test message with a link in it (50 units): ${testMessage.slice(0, 60)}…`);
                     note('Now LOOK at the chat from a SECOND account, switched from "Top chat" to "Live chat".');
                     note('If you can see it and they cannot, the channel\'s chat filtering is eating the bot —');
                     note('make sure the bot account is a moderator. The API reports success either way.');

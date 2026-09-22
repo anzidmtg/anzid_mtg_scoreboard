@@ -365,10 +365,13 @@ export function youtubeDecklistsMessage(opts, mention, listsUrl, max = 200) {
     const r = readOnAir(opts);
     const lists = listsUrl ? `All lists here: ${listsUrl}` : '';
     if (!r && !lists) return null;
-    const head = !r ? '' : r.live ? `On stream now — ${r.text}` : r.text;
+    // "… vs Blank (LeBlanc). All lists here: …" — the full stop matters, or the
+    // pairing and the link run together as one sentence.
+    const said = !r ? '' : r.live ? `On stream now — ${r.text}` : r.text;
+    const head = said && !/[.!?]$/.test(said) ? `${said}.` : said;
     for (const withMention of [true, false]) {
-        const prefix = withMention ? `${mention} ` : '';
-        const whole = [prefix + head, lists].filter(Boolean).join(' ').trim();
+        const prefix = withMention ? mention : '';
+        const whole = [prefix, head, lists].filter(Boolean).join(' ').trim();
         if (len(whole) <= max) return whole || null;
     }
     // Still too long: keep the lists line intact and cut the match line to fit.
