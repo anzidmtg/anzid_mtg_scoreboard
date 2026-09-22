@@ -143,6 +143,48 @@ The server then mints an **app access token** itself (~58 days, no refresh
 token to rotate or lose) and re-mints a day before expiry. Nothing to maintain
 mid-show. Boot logs `chat sending ready` when the credentials work.
 
+#### Optional: let the bot REPLY in YouTube chat
+
+Reading is an API key; replying is OAuth, and it can only ever say the short
+form. `!decklists` on YouTube is ONE message — the match line plus the lists doc
+— because YouTube caps a chat message at 200 characters and the Piltover
+deck-code links are 221-242 on their own. Card disambiguation prompts are never
+sent there: the answer arrives on a poll, long after the 5-second window.
+
+1. Decide WHO posts. A separate bot channel is the safer choice (the token
+   cannot touch your videos, and chat can see it is a bot). **Make that account
+   a moderator of the channel** — YouTube Help says URLs are not allowed in live
+   chat, and a moderator's links are what actually appear.
+2. In the SAME Cloud project as the reader's key (so one quota is visible in one
+   place): Credentials → Create credentials → OAuth client ID → **Desktop app**.
+3. OAuth consent screen: add scope `.../auth/youtube.force-ssl`, then **Publish
+   app** so the status is "In production". Left in "Testing", Google expires the
+   refresh token after **7 days** and chat dies between shows. Verification is
+   not required — you are the only user, which Google's docs name as the
+   exception; you will see one "unverified app" screen during step 4.
+4. `node scripts/chat/youtube-auth.mjs` — sign in as the posting account, and it
+   prints the refresh token to paste into `.env`. Nothing is written to disk.
+5. Add to `.env`:
+   ```
+   YOUTUBE_CLIENT_ID=...
+   YOUTUBE_CLIENT_SECRET=...
+   YOUTUBE_REFRESH_TOKEN=...
+   ```
+6. **Test from a second account** watching the stream, with chat switched from
+   "Top chat" to "Live chat". A message the API accepted can still be filtered
+   out for everyone else, and the API reports success either way.
+
+**Quota, honestly.** A reply costs 50 units from the same 10,000 a day reading
+spends. The bot holds itself to 2,000 units of replies a day (40 messages), at
+most 8 an hour, and answers `!decklists` on YouTube once every 15 minutes. Past
+any of those it declines rather than starving the reader.
+
+| Where | What it shows |
+|---|---|
+| `GET /api/chat-bridge/youtube-usage` | plain text: units used, split reading vs replies, and how many replies are left today |
+| `GET /api/chat-bridge/status` | the same as JSON, under `youtube.quota` |
+| Cloud Console → APIs & Services → Quotas | Google's own count — the authority |
+
 #### Optional: read YouTube live chat too
 
 YouTube is **read-only** — posting costs ~50 quota units a message and needs

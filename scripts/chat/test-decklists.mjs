@@ -789,5 +789,81 @@ check('the real data/controlData.json was never touched', realHash() === REAL_BE
     check('an 8-hour show at 3s does NOT (this is why 5s is the default)', units(8, 3000) > 9000, `${units(8, 3000)} units`);
 }
 
+// ── 14. YouTube replies: one short message, and a quota that can't run away ──
+{
+    const { youtubeDecklistsMessage, _internal: yti } = await import('../../features/chat-bridge.js');
+    const { createYouTubeSender, MAX_MESSAGE, messageLength } = await import('../../features/chat/youtube-send.js');
+    const q = await import('../../features/chat/youtube-quota.js');
+    const DOC = 'https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ';
+    const ytAir = (extra = {}) => ({ ...base, scene: 'Match 1 - Live + Hand Blue', data: { 1: { match1: ONAIR } }, ...extra });
+
+    const one = youtubeDecklistsMessage(ytAir(), '@viewer', DOC);
+    check('youtube: one message, naming the match and the lists doc',
+        /On stream now — Match 1: Anu \(Rengar\) vs Asc Samdsherman \(LeBlanc\)/.test(one) && one.includes(DOC), one);
+    check('youtube: it fits the 200-character limit', messageLength(one) <= 200, `${messageLength(one)} chars`);
+    check('youtube: no deck-code link is attempted (they are 221+ chars)', !one.includes('deckbuilder?code='), one);
+    // a long pairing must give way to the doc link, never the other way round
+    const longNames = { ...ONAIR, 'player-name-left': 'A'.repeat(40), 'player-name-right': 'B'.repeat(40) };
+    const squeezed = youtubeDecklistsMessage(ytAir({ data: { 1: { match1: longNames } } }), '@someoneWithALongName', DOC);
+    check('youtube: a long pairing is cut, the doc link is kept whole',
+        messageLength(squeezed) <= 200 && squeezed.endsWith(DOC) && squeezed.includes('…'), `${messageLength(squeezed)}: ${squeezed}`);
+    check('youtube: nothing on air still gets the lists doc rather than silence',
+        (youtubeDecklistsMessage({ ...ytAir(), scene: null }, '@v', DOC) || '').includes(DOC));
+    check('youtube: no doc configured and nothing on air -> stay quiet',
+        youtubeDecklistsMessage({ ...ytAir(), scene: null }, '@v', '') === null);
+
+    // the sender: refuses rather than spending 50 units on a doomed message
+    q._reset();
+    const calls = [];
+    const fakeFetch = async (url, init) => {
+        calls.push({ url: String(url), body: init?.body });
+        if (String(url).includes('oauth2')) return { ok: true, status: 200, text: async () => JSON.stringify({ access_token: 'tok', expires_in: 3600 }) };
+        return { ok: true, status: 200, json: async () => ({ id: 'x' }), text: async () => '{}' };
+    };
+    const live = createYouTubeSender({ clientId: 'c', clientSecret: 's', refreshToken: 'r', liveChatId: () => 'CHAT1', fetchImpl: fakeFetch });
+    let sent = await live.say('hello youtube');
+    check('youtube sender: posts to the live chat id, as a text message', sent.ok
+        && calls.at(-1).url.includes('/liveChat/messages?part=snippet')
+        && JSON.parse(calls.at(-1).body).snippet.liveChatId === 'CHAT1'
+        && JSON.parse(calls.at(-1).body).snippet.type === 'textMessageEvent', JSON.stringify(sent));
+    check('youtube sender: one message costs 50 units on the shared ledger', q.snapshot().sending.units === 50 && q.snapshot().sending.messages === 1, JSON.stringify(q.snapshot().sending));
+    const before = calls.length;
+    sent = await live.say('x'.repeat(MAX_MESSAGE + 1));
+    check('youtube sender: over 200 characters is refused before spending anything',
+        sent.ok === false && sent.reason === 'too-long' && calls.length === before && q.snapshot().sending.units === 50, JSON.stringify(sent));
+    const offline = createYouTubeSender({ clientId: 'c', clientSecret: 's', refreshToken: 'r', liveChatId: () => null, fetchImpl: fakeFetch });
+    sent = await offline.say('nobody is live');
+    check('youtube sender: nothing to post to when no broadcast is live', sent.ok === false && sent.reason === 'not-live');
+    const unset = createYouTubeSender({ clientId: '', clientSecret: '', refreshToken: '', fetchImpl: fakeFetch });
+    check('youtube sender: not configured -> says so, never throws', unset.configured === false && (await unset.say('x')).ok === false);
+
+    // the caps, which are what stop a raid becoming a quota fire
+    q._reset();
+    for (let i = 0; i < q.SEND_PER_HOUR; i++) q.spend(q.SEND_COST, 'send');
+    check('youtube quota: the hourly cap stops further replies', q.canSend().ok === false && q.canSend().reason === 'hourly-cap', JSON.stringify(q.canSend()));
+    q._reset();
+    q.spend(q.SEND_BUDGET, 'send');
+    check('youtube quota: replies cannot eat more than their slice of the day', q.canSend().reason === 'send-budget');
+    q._reset();
+    q.spend(q.DAILY_BUDGET, 'read');
+    check('youtube quota: reading having spent the day also stops replies', q.canSend().reason === 'daily-budget');
+    check('youtube quota: reading and sending are counted as one allowance',
+        q.snapshot().units.used === q.DAILY_BUDGET && q.snapshot().left.messages === 0, JSON.stringify(q.snapshot().units));
+    q._reset();
+
+    // end to end through the bridge: a YouTube viewer asking, and the caps
+    const said = [];
+    const ytBridge = initChatBridge(app, io, { connect: false, say: async () => {}, describeOnAir: describe,
+        youtubeSay: async (t) => { said.push(t); return { ok: true }; },
+        youtubeDecklistsMessage: (mention) => `${mention} On stream now — Match 1: Anu vs Blank. All lists here: ${DOC}` });
+    const ytViewer = (id) => ({ platform: 'youtube', userId: id, login: id, displayName: id, text: '!decklists' });
+    ytBridge.handle(ytViewer('yt-1'));
+    ytBridge.handle(ytViewer('yt-2'));
+    await settle();
+    check('youtube: a viewer there gets an answer', said.length === 1 && said[0].startsWith('@yt-1 On stream now'), JSON.stringify(said));
+    check('youtube: the next viewer waits out the longer window', said.length === 1, `${said.length} messages`);
+    check('youtube: the window is 15 minutes, not Twitch\'s 1', _internal.DEFAULTS.youtubeDecklistsCooldownMs === 900000);
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

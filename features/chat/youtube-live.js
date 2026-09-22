@@ -42,17 +42,17 @@
 // connection lifetime, the dedup rules across reconnects, nor any reconnection
 // rate limit — so it is deliberately not used here. See DEPLOY.md.
 
+import { spend as spendQuota, noteSearch, searchesLeft, spentFrac as ledgerSpentFrac, snapshot as quotaSnapshot, DAILY_BUDGET as LEDGER_BUDGET } from './youtube-quota.js';
+
 const API = 'https://www.googleapis.com/youtube/v3';
 const DEFAULT_POLL_MS = 5000;   // fits a 10h show at 72% of the default quota
 const MIN_POLL_MS = 1000;       // the API itself never asks for faster
-const DAILY_BUDGET = 9000;      // leave headroom under the 10k default
 const OFFLINE_MS = 60000;       // nothing live, video pinned: 1 unit a try
 // Nothing live and no pinned video: each look costs a search, and there are
 // only ~100 a day. At 15 minutes a look, a server left running around the clock
 // spends 96 — so it can still find the stream tomorrow. The cost is that going
 // live can take up to 15 minutes to notice; YOUTUBE_VIDEO_ID is instant.
 const DISCOVERY_MS = 15 * 60 * 1000;
-const DAILY_SEARCHES = 90;
 // Chat is not busy for most of a show. Reading every few seconds through an
 // hour of silence spends the same quota as reading through an hour of a packed
 // chat, and buys nothing — so the reader slows down when nobody is talking and
@@ -123,16 +123,10 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     let stopped = false, liveChatId = null, pageToken = null;
     let connected = false, timer = null, primed = false, paused = false;
     let lastMessageAt = Date.now(), misses = 0;
-    let used = 0, searches = 0, day = new Date().toDateString();
     const seen = new Set();          // liveChatMessageId, guards the first-page backlog
 
-    const rollover = () => {
-        const today = new Date().toDateString();
-        if (today === day) return;
-        day = today; used = 0; searches = 0;
-        log('quota counters reset (the server\'s midnight, not necessarily Pacific)');
-    };
-    const spend = (n) => { rollover(); used += n; return used; };
+    // Reads and replies share one allowance — see features/chat/youtube-quota.js.
+    const spend = (n) => spendQuota(n, 'read');
 
     // Everything tied to one broadcast's chat. Cleared together: a page token
     // minted for the old chat is rejected by the new one, and the new chat's
@@ -147,9 +141,8 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     async function findVideoId() {
         if (videoId) return videoId;
         if (!channelId) throw new Error('set YOUTUBE_VIDEO_ID or YOUTUBE_CHANNEL_ID');
-        rollover();
-        if (searches >= DAILY_SEARCHES) throw new Error('search budget spent for today — set YOUTUBE_VIDEO_ID to pin the broadcast');
-        searches++;
+        if (searchesLeft() <= 0) throw new Error('search budget spent for today — set YOUTUBE_VIDEO_ID to pin the broadcast');
+        noteSearch();
         const j = await api('search', { part: 'id', channelId, eventType: 'live', type: 'video', maxResults: '1' }, apiKey);
         const id = j.items?.[0]?.id?.videoId;
         if (!id) throw new Error('no live broadcast found on that channel');
@@ -159,7 +152,7 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     async function resolveChat() {
         const vid = await findVideoId();
         const j = await api('videos', { part: 'liveStreamingDetails', id: vid }, apiKey);
-        spend(1);
+        spendQuota(1, 'resolve');
         const id = j.items?.[0]?.liveStreamingDetails?.activeLiveChatId;
         if (!id) throw new Error(`video ${vid} has no active live chat (not live, or chat disabled)`);
         liveChatId = id;
@@ -178,9 +171,9 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
         try {
             if (!liveChatId) await resolveChat();
 
-            if (used >= DAILY_BUDGET) {
+            if (quotaSnapshot().units.used >= LEDGER_BUDGET) {
                 connected = false;
-                onStatus(`daily quota budget reached (${used}) — pausing until reset`);
+                onStatus(`daily quota budget reached (${quotaSnapshot().units.used}) — pausing until reset`);
                 waitMs = 15 * 60 * 1000;
             } else {
                 const j = await api('liveChat/messages', {
@@ -227,7 +220,7 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
                 waitMs = nextPollMs({
                     floorMs, gotMessages: fresh, quietMs: Date.now() - lastMessageAt,
                     paused, apiHintMs: Number(j.pollingIntervalMillis) || 0,
-                    spentFrac: used / DAILY_BUDGET,
+                    spentFrac: ledgerSpentFrac(),
                 });
             }
         } catch (e) {
@@ -255,6 +248,9 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     return {
         stop() { stopped = true; clearTimeout(timer); connected = false; onStatus('stopped'); },
         isConnected: () => connected,
+        // The sender needs this, read fresh on every post: the id belongs to
+        // one broadcast and forgetChat() drops it when that broadcast ends.
+        liveChatId: () => liveChatId,
         // The bridge's kill switch calls this: a paused bot should not spend
         // the day's quota reading chat it will ignore.
         setPaused(p) {
@@ -262,9 +258,9 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
             paused = !!p;
             if (was && !paused) { clearTimeout(timer); lastMessageAt = Date.now(); poll(); }
         },
-        quotaUsed: () => used,
+        quotaUsed: () => quotaSnapshot().units.used,
         // Its own daily bucket, and the one that decides whether channelId mode
         // can still find a stream today — so it is worth seeing separately.
-        searchesUsed: () => searches,
+        searchesUsed: () => quotaSnapshot().searches.used,
     };
 }
