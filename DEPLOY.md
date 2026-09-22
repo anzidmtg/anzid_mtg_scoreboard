@@ -158,39 +158,52 @@ cannot see.
 4. Add to `.env`:
    ```
    YOUTUBE_API_KEY=...
-   YOUTUBE_CHANNEL_ID=UC...      # auto-finds whatever is live — set this one
-   # YOUTUBE_VIDEO_ID=...        # or pin one broadcast (needs editing per stream)
-   # YOUTUBE_POLL_MS=3000        # default 3000, clamped to >= 1000
+   YOUTUBE_CHANNEL_ID=UC...      # finds whatever is live by itself
+   # YOUTUBE_VIDEO_ID=...        # or pin one broadcast (edit per stream)
+   # YOUTUBE_POLL_MS=5000        # default 5000, clamped to >= 1000
    ```
    Your channel ID is in YouTube Studio → Settings → Channel → Advanced.
+   anzidmtg is `UCskein7E6WikZYKemXqxCSw`.
 
-Prefer `YOUTUBE_CHANNEL_ID`: it is read once at boot, so pinning a video id
-means editing `.env` and restarting the server before every stream, which drops
-every overlay and iPad. Channel discovery uses `search.list`, which has its own
-100-calls/day bucket separate from the 10,000 units.
+5. Check it before you need it: `node scripts/chat/youtube-check.mjs`. It
+   resolves the key, the channel and the live chat and reads one page, printing
+   what it spent. `--handle @name`, `--video <id>` and `--channel UC...`
+   override `.env`. It never prints the key.
+
+Which to set:
+
+- `YOUTUBE_CHANNEL_ID` needs no attention per stream, but finding the broadcast
+  costs a `search.list` call from its OWN bucket of ~100 a day. The reader looks
+  every 15 minutes while nothing is live (96 a day, under the bucket, so it can
+  still find a stream tomorrow) — so going live takes up to 15 minutes to be
+  noticed.
+- `YOUTUBE_VIDEO_ID` connects immediately and spends no searches, but it means
+  editing `.env` and restarting before every stream, which drops every overlay
+  and iPad. Take the id from the watch URL: `youtube.com/watch?v=THIS_PART`.
+
+Set both and the video id wins.
 
 **Quota.** 10,000 units/day per PROJECT (not per key), resetting Pacific time.
-Google does not document the per-call cost of `liveChatMessages.list`; the
-figures below assume the general "a list operation costs 1 unit" rule.
+Google's quota table documents `liveChatMessages.list` and `videos.list` at 1
+unit each, and `search.list` as its own ~100-calls/day bucket.
 
-| Poll interval | Calls in 6h | Units | Of 10,000 |
+| Poll interval | Calls in 10h | Units | Of 10,000 |
 |---|---|---|---|
-| 1s | 21,600 | 21,600 | 216% — over |
-| 2s | 10,800 | 10,800 | 108% — over |
-| **3s** | **7,200** | **7,200** | **72% — default** |
-| 6s | 3,600 | 3,600 | 36% — room for two shows |
+| 1s | 36,000 | 36,000 | 360% — over |
+| 3s | 12,000 | 12,000 | 120% — over |
+| **5s** | **7,200** | **7,200** | **72% — default** |
+| 6s | 6,000 | 6,000 | 60% — room for two shows |
 
-**Verify this before trusting it.** Watch `quotaUsed` on the status endpoint
-for the first hour of a real stream: ~1,200 after an hour at 3s means 1 unit per
-call and the table holds; ~6,000 means 5 units, and polling cannot cover a
-6-hour show at any interval. The adapter stops itself at 9,000 and pauses.
+The adapter stops itself at 9,000 units and pauses until the counter resets, so
+a too-fast interval costs you the END of the show, quietly. `sources[].quotaUsed`
+and `sources[].searchesUsed` on the status endpoint are the two numbers to
+watch; Cloud Console → APIs & Services → Quotas shows Google's own view.
 
 A push-based alternative exists — `liveChatMessages.streamList`, a gRPC
 server-streaming endpoint with much lower latency and no polling cost. It needs
 `@grpc/grpc-js` plus proto handling, and Google documents neither the
 connection lifetime, the dedup rules across reconnects, nor any reconnection
-rate limit. Not used here for that reason; revisit if the quota check comes back
-above 1 unit per call.
+rate limit. Not used here for that reason.
 
 #### Operating it
 

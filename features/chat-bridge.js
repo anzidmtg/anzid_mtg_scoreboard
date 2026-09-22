@@ -730,6 +730,9 @@ export function initChatBridge(app, io, opts = {}) {
             name: s.name,
             connected: s.conn.isConnected(),
             ...(s.conn.quotaUsed ? { quotaUsed: s.conn.quotaUsed() } : {}),
+            // Its own ~100/day bucket, separate from the 10,000 units — and
+            // what runs out first if the stream isn't pinned by video id.
+            ...(s.conn.searchesUsed ? { searchesUsed: s.conn.searchesUsed() } : {}),
         })),
         connected: sources.some(s => s.conn.isConnected()),
         shownThisStream, cooldownMs: cfg.cooldownMs, admins: [...admins],
