@@ -116,3 +116,14 @@ data/obs exports/*.bak
 public/js/restream-config.js
 .env.bak-*
 .env.backup
+
+# Carde.io exports carry players' emails and real names (registrations,
+# standings, pairings and match exports), and decklist caches carry first
+# name + initial. They are runtime caches the server re-fetches from Carde —
+# never commit them: this repo is public. Files committed before this rule
+# are still tracked until they are removed with `git rm --cached`.
+data/cardeio/**/*registrations*.json
+data/cardeio/**/pairings-*.json
+data/cardeio/**/standings-*.json
+data/cardeio/**/matches-*.json
+data/cardeio/**/event-*-decklists.json
