@@ -772,10 +772,21 @@ check('the real data/controlData.json was never touched', realHash() === REAL_BE
         nextPollMs({ floorMs, gotMessages: 1, quietMs: 0, apiHintMs: 1000 }) === 5000);
     check('pacing: an operator floor slower than idle is never sped up',
         nextPollMs({ floorMs: 15000, gotMessages: 0, quietMs: 150000 }) === 15000);
+    check('pacing: a long between-rounds lull backs off further',
+        nextPollMs({ floorMs, gotMessages: 0, quietMs: 20 * 60000 }) === 30000);
+    // an overrunning show costs latency, not the feature
+    check('hedge: 80% of the budget spent -> stretch to 10s', nextPollMs({ floorMs, gotMessages: 3, quietMs: 0, spentFrac: 0.82 }) === 10000);
+    check('hedge: 90% -> 20s', nextPollMs({ floorMs, gotMessages: 3, quietMs: 0, spentFrac: 0.91 }) === 20000);
+    check('hedge: 95% -> 30s, still reading rather than dark', nextPollMs({ floorMs, gotMessages: 3, quietMs: 0, spentFrac: 0.99 }) === 30000);
+    check('hedge: an 8-hour show never reaches those tiers', (8 * 3600 / 5) / 9000 < 0.8, `${((8 * 3600 / 5) / 9000 * 100).toFixed(0)}% of budget`);
+    check('hedge: a busy chat still wins over a long-quiet backoff', nextPollMs({ floorMs, gotMessages: 4, quietMs: 20 * 60000 }) === 5000);
+
     // what a real show costs: the number the user actually asked about
     const units = (hours, ms) => Math.round((hours * 3600 * 1000) / ms);
     check('a 6-hour show at 5s fits the daily pool with room to spare', units(6, 5000) === 4320 && units(6, 5000) < 9000, `${units(6, 5000)} units`);
     check('a 6-hour show at 3s still fits', units(6, 3000) === 7200 && units(6, 3000) < 9000, `${units(6, 3000)} units`);
+    check('an 8-hour show at 5s fits inside the budget', units(8, 5000) === 5760 && units(8, 5000) < 9000, `${units(8, 5000)} units`);
+    check('an 8-hour show at 3s does NOT (this is why 5s is the default)', units(8, 3000) > 9000, `${units(8, 3000)} units`);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

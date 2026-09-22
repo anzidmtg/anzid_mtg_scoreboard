@@ -60,7 +60,20 @@ const DAILY_SEARCHES = 90;
 // affordable across a long day.
 const IDLE_POLL_MS = 10000;      // after QUIET_AFTER_MS with nothing said
 const QUIET_AFTER_MS = 120000;
+const LONG_IDLE_POLL_MS = 30000; // after LONG_QUIET_AFTER_MS: a between-rounds lull
+const LONG_QUIET_AFTER_MS = 900000;
 const PAUSED_POLL_MS = 60000;    // kill switch is off: nothing acts on chat anyway
+// Running out of quota mid-show used to mean chat simply stopped (a 15-minute
+// sleep, over and over, until midnight Pacific). A show that runs longer than
+// planned should cost latency, not the feature: past these fractions of the
+// day's budget the reader stretches its interval so what is left lasts. An 8h
+// show at 5s spends 64% and never reaches them; a 12h one degrades instead of
+// going dark. Highest fraction first.
+const BUDGET_TIERS = [
+    { spent: 0.95, ms: 30000 },
+    { spent: 0.90, ms: 20000 },
+    { spent: 0.80, ms: 10000 },
+];
 
 const log = (m) => console.log(`[youtube-live] ${m}`);
 
@@ -82,9 +95,14 @@ async function api(path, params, key) {
 
 // How long to wait before the next read. Pure, so the pacing can be tested
 // without the network: see scripts/chat/test-decklists.mjs.
-export function nextPollMs({ floorMs, gotMessages, quietMs, paused = false, apiHintMs = 0 }) {
+export function nextPollMs({ floorMs, gotMessages, quietMs, paused = false, apiHintMs = 0, spentFrac = 0 }) {
     if (paused) return PAUSED_POLL_MS;
-    const mine = gotMessages || quietMs < QUIET_AFTER_MS ? floorMs : Math.max(floorMs, IDLE_POLL_MS);
+    // Never faster than the interval the operator set, whatever the tier says.
+    const quiet = Math.max(floorMs, quietMs >= LONG_QUIET_AFTER_MS ? LONG_IDLE_POLL_MS
+        : quietMs >= QUIET_AFTER_MS ? IDLE_POLL_MS
+        : 0);
+    const low = BUDGET_TIERS.find(t => spentFrac >= t.spent)?.ms || 0;
+    const mine = Math.max(gotMessages ? floorMs : quiet, low);
     // YouTube's own hint is honoured only when it asks us to go SLOWER: it
     // drops to ~1s on a busy chat, which would burn the day in under 3 hours.
     return Math.max(mine, apiHintMs || 0);
@@ -104,7 +122,7 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     const floorMs = Math.max(MIN_POLL_MS, Number(pollMs) || DEFAULT_POLL_MS);
     let stopped = false, liveChatId = null, pageToken = null;
     let connected = false, timer = null, primed = false, paused = false;
-    let lastMessageAt = Date.now();
+    let lastMessageAt = Date.now(), misses = 0;
     let used = 0, searches = 0, day = new Date().toDateString();
     const seen = new Set();          // liveChatMessageId, guards the first-page backlog
 
@@ -146,6 +164,7 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
         if (!id) throw new Error(`video ${vid} has no active live chat (not live, or chat disabled)`);
         liveChatId = id;
         connected = true;
+        misses = 0;
         onStatus(`reading chat for video ${vid}`);
     }
 
@@ -208,6 +227,7 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
                 waitMs = nextPollMs({
                     floorMs, gotMessages: fresh, quietMs: Date.now() - lastMessageAt,
                     paused, apiHintMs: Number(j.pollingIntervalMillis) || 0,
+                    spentFrac: used / DAILY_BUDGET,
                 });
             }
         } catch (e) {
@@ -220,7 +240,10 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
             if (e.quotaExceeded) { onStatus('QUOTA EXCEEDED — backing off 30m'); waitMs = 30 * 60 * 1000; }
             else if (noChat) {
                 forgetChat();
-                waitMs = videoId ? OFFLINE_MS : DISCOVERY_MS;
+                // Each look at a pinned video costs a unit, so a stale id left
+                // in .env overnight would quietly eat the morning's budget.
+                misses++;
+                waitMs = videoId ? Math.min(OFFLINE_MS * Math.min(misses, 5), 5 * 60 * 1000) : DISCOVERY_MS;
                 onStatus(`${e.message} — looking again in ${Math.round(waitMs / 60000) || 1}m`);
             }
             else { onStatus(`error: ${e.message}`); waitMs = 30000; }

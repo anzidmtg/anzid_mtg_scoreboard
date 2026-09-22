@@ -187,12 +187,15 @@ Set both and the video id wins.
 Google's quota table documents `liveChatMessages.list` and `videos.list` at 1
 unit each, and `search.list` as its own ~100-calls/day bucket.
 
-| Poll interval | Calls in 10h | Units | Of 10,000 |
+| Poll interval | Units in a 6h show | In an 8h show | In 10h |
 |---|---|---|---|
-| 1s | 36,000 | 36,000 | 360% — over |
-| 3s | 12,000 | 12,000 | 120% — over |
-| **5s** | **7,200** | **7,200** | **72% — default** |
-| 6s | 6,000 | 6,000 | 60% — room for two shows |
+| 3s | 7,200 — 72% | 9,600 — **over the 9,000 budget** | 12,000 — over |
+| 4s | 5,400 — 54% | 7,200 — 80% | 9,000 — at the line |
+| **5s** | **4,320 — 43%** | **5,760 — 58%** | 7,200 — 72% |
+| 6s | 3,600 — 36% | 4,800 — 48% | 6,000 — 60% |
+
+5s is the default because it carries an 8-hour show at 58% of the pool while
+still reading every 5s. 3s only fits a show of about 6 hours.
 
 Those rows are worst case. The reader only polls while a chat is actually live,
 slows to one read every 10s when nobody has spoken for two minutes, and drops to
@@ -200,8 +203,10 @@ one a minute while the kill switch is off — so a real 4-6 hour show costs well
 under its row. A 6-hour show at 5s is ~4,300 units even if chat never goes quiet,
 which leaves room for a second show the same day.
 
-The adapter stops itself at 9,000 units and pauses until the counter resets, so
-a too-fast interval costs you the END of the show, quietly.
+If a show overruns anyway, the reader stretches its interval rather than going
+dark: 10s once 80% of the budget is spent, 20s at 90%, 30s at 95%. Chat gets
+slower, not switched off. Only past the full 9,000 does it stop and wait for the
+counter to reset.
 
 **If you ever do need more than 10,000/day**, the only legitimate route is
 Google's "YouTube API Services - Audit and Quota Extension" form: a compliance
