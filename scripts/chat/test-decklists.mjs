@@ -488,16 +488,17 @@ check('REVIEW F11: a re-sent bare !p1 gets usage, not a link error', r1.said[0] 
     releaseSlot('3');
 }
 {
-    // AUDIT: …and an admin's, too — the admins were the only people whose card
-    // the command swallowed
+    // …but an admin's "!p1 <anything>" stays the deck command, whatever is on
+    // the line: it is what follows !p1 that is meant to be a deck link, and
+    // saying so beats putting a card on air instead.
     releaseSlot('3');
     const shownNow = [], said = [];
     const ioC = { emit: (ev, d) => { if (ev === 'chat-card-shown') shownNow.push(d.name); }, to: () => ({ emit() {} }), sockets: { emit() {} } };
     const br = initChatBridge(app, ioC, { connect: false, cooldownMs: 0, dwellMs: 60000, say: async (t) => { said.push(t); }, describeOnAir: describe,
-        deckTarget: () => MATCH1, loadPlayerDeck: async () => { throw new Error('must not load'); } });
+        deckTarget: () => MATCH1 });
     br.handle({ platform: 'twitch', userId: 'a14', login: 'anzidmtg', displayName: 'anzidmtg', text: '!p1 [[Loose Cannon]]' });
     await settle();
-    check('AUDIT: an admin\'s "!p1 [[card]]" shows the card instead of a link error', shownNow.length === 1 && /Loose Cannon/.test(shownNow[0]) && said.length === 0, JSON.stringify([shownNow, said]));
+    check('an admin\'s "!p1 [[card]]" is a bad deck link, not a card on air', shownNow.length === 0 && /isn't a Piltover Archive deck link/.test(said[0] || ''), JSON.stringify([shownNow, said]));
     releaseSlot('3');
 }
 r1 = await adminRun({ text: `!p1 ${VIEW}`, game: 'mtg' });

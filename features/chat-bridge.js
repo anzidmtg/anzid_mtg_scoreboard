@@ -626,12 +626,12 @@ export function initChatBridge(app, io, opts = {}) {
         const key = `${msg.platform}:${msg.userId}`;
         if (pending.tryPick(key, msg.text)) return;
 
-        // Admin deck loading. Anyone else's "!p1 …" is just a chat line — no
-        // reply advertising a command they can't use, and a [[card]] in it
-        // still works. An admin's line carrying a [[card]] is a card request
-        // too: a deck link never contains one, and the admin would otherwise
-        // be the only person whose card is swallowed.
-        const deckCmd = isAdmin(msg) && !msg.text.includes('[[') && parsePlayerDeckCommand(msg.text);
+        // Admin deck loading. An admin's "!p1 …" is always the deck command —
+        // whatever follows is meant to be a deck link, so a line that isn't one
+        // gets told so rather than quietly doing something else. Anyone else's
+        // "!p1 …" is just a chat line: no reply advertising a command they
+        // can't use, and a [[card]] in it still works.
+        const deckCmd = isAdmin(msg) && parsePlayerDeckCommand(msg.text);
         if (deckCmd) { if (canPromptOn(msg.platform)) loadPlayerDeck(msg, deckCmd); return; }
 
         // Checked before the card command, and deliberately leaves this
