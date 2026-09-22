@@ -22,7 +22,9 @@
 // Twitch credentials are configured.
 //
 //   viewer:  !decklists
-//   bot:     @viewer Match 1: justmilkey (Jayce) vs Blank (LeBlanc)
+//   bot:     @viewer Match 1: justmilkey (Jayce) vs Blank (LeBlanc) — decklists below
+//   bot:     justmilkey (Jayce): https://piltoverarchive.com/deckbuilder?code=…
+//   bot:     Blank (LeBlanc): https://piltoverarchive.com/deckbuilder?code=…
 //
 // A chat reply only — it never touches anything on air. It answers for the
 // match OBS has on program, reading the same data that match's header is
@@ -33,6 +35,8 @@ import { emitCardView } from './cards.js';
 import { getGameSelection, getPlayerCount } from '../config/constants.js';
 import { getControlsTracker, getControlData, getBroadcastTracker, isScoreboardInSync } from './control.js';
 import { getCurrentProgramScene } from './obs-websocket.js';
+import { findRiftboundCard } from './riftbound/cards.js';
+import { verifiedDeckCode, PILTOVER_BUILDER } from './riftbound/deck-code.js';
 import { connectTwitchChat } from './chat/twitch-irc.js';
 import { connectYouTubeChat } from './chat/youtube-live.js';
 import { resolveCardName } from './chat/resolve.js';
@@ -157,11 +161,73 @@ function describeMatch(d, game, playerCount) {
     return l && r ? `${l} vs ${r}` : null;
 }
 
-// The reply for whatever is on air, or null when that can't be known: the OBS
-// link is down, or the on-air header hasn't been sent this server's data since
-// boot (after a restart it goes on showing the old show). null = stay quiet
-// rather than guess.
-export function describeOnAir({
+// ── Deck links ──────────────────────────────────────────────────────────────
+// Each player's link comes from the first source below that can produce one.
+// Today there is one: Piltover Archive's deck builder, opened with a deck code
+// built from the list ON THE BOARD — so the link is always the exact deck the
+// scoreboard is showing, it can't go stale when a deck is swapped, and it needs
+// nothing created anywhere. A future source (a Carde.io or Riftdecks page, say)
+// is one more function in this list, tried in order.
+//
+// The board's runes are colour letters plus counts; this is the inverse of
+// RUNE_NAME_TO_LETTER in public/js/shared/deck-parse.js, which writes them.
+const RUNE_LETTER_TO_NAME = { r: 'Fury', g: 'Calm', b: 'Mind', o: 'Body', p: 'Chaos', y: 'Order' };
+
+// The board's deck for one slot as { main, side, champion } card codes, or null
+// if any part is missing or any card can't be identified exactly.
+function boardDeck(d, slot) {
+    const lines = (v) => (Array.isArray(v) ? v : String(v ?? '').split('\n')).map(s => String(s).trim()).filter(Boolean);
+    const legend = String(d[`player-legend-${slot}`] || '').trim();
+    const champion = String(d[`player-champion-${slot}`] || '').trim();
+    const mainLines = lines(d[`player-main-deck-${slot}`]);
+    if (!legend || !champion || !mainLines.length) return null;
+
+    const code = (name) => findRiftboundCard(name)?.card?.publicCode || null;
+    const main = new Map(), side = new Map();
+    const add = (into, qty, name) => {
+        const c = code(name), n = Number(qty);
+        if (!c || !Number.isInteger(n) || n < 1) return false;
+        into.set(c, (into.get(c) || 0) + n);
+        return true;
+    };
+    const parsed = (line) => line.match(/^(\d+)\s+(.+)$/);
+    if (!add(main, 1, legend) || !add(main, 1, champion)) return null;
+    for (const line of mainLines) { const m = parsed(line); if (!m || !add(main, m[1], m[2])) return null; }
+    for (const i of [1, 2, 3]) {
+        const bf = String(d[`player-battlefield-${i}-${slot}`] || '').trim();
+        if (bf && !add(main, 1, bf)) return null;
+    }
+    for (const i of [1, 2]) {
+        const letter = d[`player-rune-color-${i}-${slot}`], qty = d[`player-rune-qty-${i}-${slot}`];
+        if (!letter && !qty) continue;
+        if (!RUNE_LETTER_TO_NAME[letter] || !add(main, qty, `${RUNE_LETTER_TO_NAME[letter]} Rune`)) return null;
+    }
+    for (const line of lines(d[`player-side-deck-${slot}`])) { const m = parsed(line); if (!m || !add(side, m[1], m[2])) return null; }
+    return { main: [...main], side: [...side], champion: code(champion) };
+}
+
+function piltoverBuilderLink(d, slot) {
+    const deck = boardDeck(d, slot);
+    const code = deck && verifiedDeckCode(deck);
+    return code ? `${PILTOVER_BUILDER}${code}` : null;
+}
+
+const DECK_LINK_SOURCES = [piltoverBuilderLink];
+
+function deckLink(d, slot) {
+    for (const source of DECK_LINK_SOURCES) {
+        try { const url = source(d, slot); if (url) return url; }
+        catch (e) { log(`deck link source failed (skipped): ${e && e.message}`); }
+    }
+    return null;
+}
+
+// Everything !decklists needs about what is on air, or null when that can't be
+// known: the OBS link is down, or the on-air header hasn't been sent this
+// server's data since boot (after a restart it goes on showing the old show).
+// null = stay quiet rather than guess. `decks` lists one entry per player for
+// matches that get links (Riftbound 1v1), with url:null when there is none.
+export function readOnAir({
     scene = getCurrentProgramScene(),
     tracker = getControlsTracker(), broadcast = getBroadcastTracker(),
     data = getControlData(), inSync = isScoreboardInSync,
@@ -169,8 +235,8 @@ export function describeOnAir({
 } = {}) {
     if (!scene) return null;
     const live = ON_AIR.filter(m => m.scene.test(scene));
-    if (!live.length) return 'no match is on air right now.';
-    const lines = [], said = new Set();
+    if (!live.length) return { text: 'no match is on air right now.', decks: [] };
+    const lines = [], decks = [], said = new Set();
     for (const m of live) {
         let d;
         if (m.from === 'control') {
@@ -183,9 +249,38 @@ export function describeOnAir({
             d = data?.[round_id]?.[m.match];
         }
         const text = d && describeMatch(d, game, playerCount);
-        if (text && !said.has(text)) { said.add(text); lines.push(`${m.label}: ${text}`); }
+        if (!text || said.has(text)) continue;
+        said.add(text);
+        lines.push(`${m.label}: ${text}`);
+        // Links only where the match line names each player with their deck —
+        // the same rule as describeMatch, so a link never outruns the screen.
+        if (game === 'riftbound' && playerCount === '1v1') {
+            for (const slot of ['left', 'right']) {
+                const who = `${plainText(d[`player-name-${slot}`])} (${shortLegend(d[`player-legend-${slot}`]) || '?'})`;
+                decks.push({ who, url: deckLink(d, slot) });
+            }
+        }
     }
-    return lines.length ? lines.join(' | ') : "the players aren't on the scoreboard yet.";
+    return lines.length ? { text: lines.join(' | '), decks } : { text: "the players aren't on the scoreboard yet.", decks: [] };
+}
+
+// The match line on its own (the first message of a reply), or null.
+export function describeOnAir(opts) {
+    const r = readOnAir(opts);
+    return r ? r.text : null;
+}
+
+// The whole reply, one string per chat message, or null to stay quiet:
+//   @viewer Match 1: Anu (Rengar) vs Blank (LeBlanc) — decklists below
+//   Anu (Rengar): https://piltoverarchive.com/deckbuilder?code=…
+//   Blank (LeBlanc): no link available
+// Separate messages because two deck links don't fit in one (a code link is
+// ~220 characters; Twitch's limit is 500).
+export function decklistMessages(opts, mention) {
+    const r = readOnAir(opts);
+    if (!r) return null;
+    if (!r.decks.length) return [`${mention} ${r.text}`];
+    return [`${mention} ${r.text} — decklists below`, ...r.decks.map(p => `${p.who}: ${p.url || 'no link available'}`)];
 }
 
 export function initChatBridge(app, io, opts = {}) {
@@ -218,8 +313,24 @@ export function initChatBridge(app, io, opts = {}) {
     let lastShownAt = 0, shownThisStream = 0, live = true;
     let lastCooldownNoticeAt = 0;
     let lastDecklistsAt = 0;
-    const describe = opts.describeOnAir || (() => describeOnAir());
+    let lastDecklistsSend = null;   // { at, messages, sent, ok, reason } — on the status page
+    // Tests inject the whole reply (decklistMessages) or just the match line
+    // (describeOnAir); production reads what is on air.
+    const messagesFor = opts.decklistMessages
+        || (opts.describeOnAir
+            ? (mention) => { const t = opts.describeOnAir(); return t ? [`${mention} ${t}`] : null; }
+            : (mention) => decklistMessages(undefined, mention));
     const botLogin = String(opts.botLogin ?? process.env.TWITCH_BOT_LOGIN ?? '').trim().toLowerCase();
+
+    // One chat message, cut by code point (a UTF-16 slice can split an emoji
+    // and send a lone surrogate) — and never through a link: a line whose link
+    // won't fit says "no link available" instead of carrying half a URL.
+    function fitMessage(m) {
+        if (Array.from(m).length <= MAX_REPLY) return m;
+        const url = m.match(/https?:\/\/\S+$/);
+        if (url) return fitMessage(`${m.slice(0, url.index)}no link available`);
+        return `${Array.from(m).slice(0, MAX_REPLY - 1).join('')}…`;
+    }
 
     function answerDecklists(msg) {
         // Nothing to do where we can't post (YouTube is read-only), and brand
@@ -229,18 +340,30 @@ export function initChatBridge(app, io, opts = {}) {
         // Read BEFORE spending the window, so a read that throws leaves the
         // next viewer free to ask. "Can't tell" still spends it: during a raid
         // that is one quiet check per window, not one per message.
-        const body = describe();
+        const messages = messagesFor(`@${msg.displayName}`);
         lastDecklistsAt = Date.now();
-        if (!body) {
+        if (!messages || !messages.length) {
             log("decklists: staying quiet — can't confirm what is on air (OBS link down, or nothing sent to that scoreboard since the server started)");
             return;
         }
-        // Cut by code point: a UTF-16 slice can split an emoji and send a lone
-        // surrogate to Twitch.
-        const chars = Array.from(body);
-        const text = chars.length > MAX_REPLY ? `${chars.slice(0, MAX_REPLY - 1).join('')}…` : body;
-        log(`decklists for ${msg.displayName}: ${text}`);
-        say(`@${msg.displayName} ${text}`).catch(() => {});
+        const out = messages.map(fitMessage);
+        log(`decklists for ${msg.displayName}: ${out.length} message(s) — ${out[0]}`);
+        // In order and one at a time (the sender spaces them ~1s apart),
+        // stopping at the first one Twitch refuses so a player's line never
+        // arrives without the match line above it. The outcome goes on the
+        // status page: a refused reply used to vanish without a trace.
+        (async () => {
+            let sent = 0, reason = null;
+            for (const m of out) {
+                const r = await say(m);
+                if (r && r.ok === false) { reason = r.reason || 'refused'; break; }
+                sent++;
+            }
+            lastDecklistsSend = { at: new Date().toISOString(), messages: out.length, sent, ok: sent === out.length, reason };
+            if (reason) log(`decklists: Twitch did not deliver message ${sent + 1} of ${out.length} (${reason})`);
+        })().catch((e) => {
+            lastDecklistsSend = { at: new Date().toISOString(), messages: out.length, sent: 0, ok: false, reason: (e && e.message) || 'error' };
+        });
     }
 
     // ── Cross-platform fairness ──────────────────────────────────────────────
@@ -482,12 +605,13 @@ export function initChatBridge(app, io, opts = {}) {
         pendingPrompts: pending.size(),
         queued: [...waiting.entries()].map(([p, e]) => ({ platform: p, card: e.card.name, waitingMs: Date.now() - e.at })),
         lastServedPlatform,
-        // What !decklists would say right now, without posting to chat — so it
-        // can be checked from here before anyone relies on it. reply:null means
-        // it would stay quiet (see describeOnAir).
+        // What !decklists would send right now, without posting to chat — so it
+        // can be checked from here before anyone relies on it. messages:null
+        // means it would stay quiet (see readOnAir); lastSend is what Twitch
+        // did with the last real reply.
         decklists: (() => {
-            try { return { programScene: getCurrentProgramScene(), reply: describe() }; }
-            catch (e) { return { error: e && e.message }; }
+            try { return { programScene: getCurrentProgramScene(), messages: messagesFor('@viewer'), lastSend: lastDecklistsSend }; }
+            catch (e) { return { error: e && e.message, lastSend: lastDecklistsSend }; }
         })(),
     }));
 
@@ -509,4 +633,4 @@ export function initChatBridge(app, io, opts = {}) {
     };
 }
 
-export const _internal = { parseCommand, isDecklistsCommand, plainText, shortLegend, describeMatch, ON_AIR };
+export const _internal = { parseCommand, isDecklistsCommand, plainText, shortLegend, describeMatch, ON_AIR, boardDeck, deckLink };

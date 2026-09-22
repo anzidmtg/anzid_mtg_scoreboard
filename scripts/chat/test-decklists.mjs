@@ -225,13 +225,109 @@ initChatBridge({ get(path, h) { if (path.endsWith('/status')) statusHandler = h;
 let status = null;
 statusHandler({}, { json: (o) => { status = o; } });
 check('status page previews what !decklists would say',
-    status?.decklists?.reply === 'Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc)', JSON.stringify(status?.decklists));
+    JSON.stringify(status?.decklists?.messages) === JSON.stringify(['@viewer Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc)']), JSON.stringify(status?.decklists));
 check('the preview posts nothing to chat', s8.length === 0);
 statusHandler = null;
 initChatBridge({ get(path, h) { if (path.endsWith('/status')) statusHandler = h; }, post() {} }, io,
     { connect: false, say: async () => {}, describeOnAir: () => { throw new Error('boom'); } });
 statusHandler({}, { json: (o) => { status = o; } });
 check('a failing read cannot break the status page', status?.decklists?.error === 'boom', JSON.stringify(status?.decklists));
+
+
+// ── 9. deck links ────────────────────────────────────────────────────────────
+// The two decks on the box's Match 1 board on 2026-09-21. GOLDEN_* are the codes
+// Piltover Archive decoded back to these exact lists, card for card, via its own
+// POST /v1/decks/export/text {deckCode}.
+const ONAIR = {"player-name-left": "Anu", "player-name-right": "Asc Samdsherman&nbsp;", "player-battlefield-left": "Emperor's Dais", "player-battlefield-right": "Windswept Hillock", "player-main-deck-left": "3 Grim Apothecary\n3 Inferna\n3 Irresistible Faefolk\n3 Kai'Sa, Survivor\n3 Kinkou Initiate\n3 Noxus Hopeful\n3 Pit Rookie\n3 Punch First\n3 Thrill of the Hunt\n2 First Mate\n2 Nidalee, Cat Form\n2 Rampage\n2 Sabotage\n1 Darius, Trifarian\n1 Ferrous Forerunner\n1 Pakaa Cub\n1 Pyke, Dockside Butcher", "player-side-deck-left": "2 Decree of Strength\n2 Ferrous Forerunner\n1 Brittle Steel\n1 Brynhir Thundersong\n1 Noxian Demolitionist\n1 Pyke, Dockside Butcher\n1 Rampage\n1 Sabotage", "player-main-deck-right": "3 Cull the Weak\n3 Deathgrip\n3 Glasc Mixologist\n3 Hidden Blade\n3 Karthus, Eternal\n3 Mirror Image\n3 Ruined Rex\n3 Soaring Scout\n3 Watchful Sentry\n2 Honest Broker\n2 Thousand-Tailed Watcher\n1 B.F. Sword\n1 Black Rose Dignitary\n1 Chakram Dancer\n1 Kennen, Keeper of Balance\n1 Ki Barrier\n1 Sacrifice\n1 Stupefy\n1 Vi, Peacekeeper", "player-side-deck-right": "3 Decree of Unity\n2 Decree of Insight\n2 Salvage\n1 Black Rose Dignitary\n1 LeBlanc, Everywhere at Once\n1 Time Warp", "player-legend-left": "Rengar, Pridestalker", "player-champion-left": "Rengar, Trophy Hunter", "player-rune-color-1-left": "r", "player-rune-qty-1-left": "4", "player-rune-color-2-left": "o", "player-rune-qty-2-left": "8", "player-battlefield-1-left": "Emperor's Dais", "player-battlefield-2-left": "Seat of Power", "player-battlefield-3-left": "Star Spring", "player-legend-right": "LeBlanc, Deceiver", "player-champion-right": "LeBlanc, Fragmented", "player-rune-color-1-right": "b", "player-rune-qty-1-right": "4", "player-rune-color-2-right": "y", "player-rune-qty-2-right": "8", "player-battlefield-1-right": "Dusk Rose Lab", "player-battlefield-2-right": "Star Spring", "player-battlefield-3-right": "Windswept Hillock"};
+const GOLDEN_LEFT = 'CMAAAAAAAEAQAAD6AAAAAAIBAAAAOAYDAAAAYJ4IAEAQGADBAUCAAAQVMFYLQAIDAIAABBABTQAQCBAAOIAQKACTAMBAAAA3Q4AQGAYACXHQDWIBAQCAAHDYW4A5OAIAAIAQGAAVAECQAVIDAIAAAGU4AEAQIAA4AMCQAA2QKMAQIADY';
+const GOLDEN_RIGHT = 'CMAAAAAAAEAQAAGWAEAAAAABAEAAAWIDAUAAAYGRAHKQDWAB5QAQEAYAUMA2KAICAQAEHSABAIAQAADUAEBQBGYBAQBAAAC7VEBACAYAUEAQQBAAI6MADLABVUA3AAOHAHIQDVYBAICQA7UHAEAQCBIAQMAQEAIAADQACAIFAA6QEAIAAB5AEBAALKMACAIEACWAC';
+const BUILDER = 'https://piltoverarchive.com/deckbuilder?code=';
+const { decklistMessages } = await import('../../features/chat-bridge.js');
+const { decodeDeck, encodeDeck } = await import('../../features/riftbound/deck-code.js');
+const air = (extra = {}) => ({ ...base, scene: 'Match 1 - Live + Hand Blue', data: { 1: { match1: ONAIR } }, ...extra });
+
+const three = decklistMessages(air(), '@viewer');
+check('reply is three messages: match line, then one per player', Array.isArray(three) && three.length === 3, JSON.stringify(three?.map(m => m.slice(0, 60))));
+check('match line says the decklists follow', three?.[0] === '@viewer Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc) — decklists below', three?.[0]);
+check('Anu\'s line links the exact Piltover-verified list', three?.[1] === `Anu (Rengar): ${BUILDER}${GOLDEN_LEFT}`, three?.[1]?.slice(0, 90));
+check('Asc Samdsherman\'s line links the exact Piltover-verified list', three?.[2] === `Asc Samdsherman (LeBlanc): ${BUILDER}${GOLDEN_RIGHT}`, three?.[2]?.slice(0, 90));
+check('every message fits Twitch\'s 500-char limit', three?.every(m => Array.from(m).length <= 500), JSON.stringify(three?.map(m => m.length)));
+
+// the link IS the board: decode it and compare with what the board holds
+const { boardDeck } = _internal;
+for (const side of ['left', 'right']) {
+    const deck = boardDeck(ONAIR, side);
+    const url = three?.[side === 'left' ? 1 : 2] || '';
+    const back = decodeDeck(url.split('code=')[1] || '');
+    const key = (l) => l.map(([c, n]) => `${c}x${n}`).sort().join(',');
+    check(`the ${side} link decodes to exactly the board's deck`, !!back && key(back.main) === key(deck.main) && key(back.side) === key(deck.side) && back.champion === deck.champion);
+}
+
+// a deck swap changes the link on its own — nothing stored that could go stale
+const swapped = { ...ONAIR, 'player-legend-left': ONAIR['player-legend-right'], 'player-champion-left': ONAIR['player-champion-right'],
+    'player-main-deck-left': ONAIR['player-main-deck-right'], 'player-side-deck-left': ONAIR['player-side-deck-right'],
+    'player-battlefield-1-left': ONAIR['player-battlefield-1-right'], 'player-battlefield-2-left': ONAIR['player-battlefield-2-right'],
+    'player-battlefield-3-left': ONAIR['player-battlefield-3-right'], 'player-rune-color-1-left': ONAIR['player-rune-color-1-right'],
+    'player-rune-qty-1-left': ONAIR['player-rune-qty-1-right'], 'player-rune-color-2-left': ONAIR['player-rune-color-2-right'],
+    'player-rune-qty-2-left': ONAIR['player-rune-qty-2-right'] };
+const sw = decklistMessages(air({ data: { 1: { match1: swapped } } }), '@viewer');
+check('swapping the deck on the board swaps the link (no stale link possible)', sw?.[1] === `Anu (LeBlanc): ${BUILDER}${GOLDEN_RIGHT}`, sw?.[1]?.slice(0, 60));
+
+// fallbacks: anything not exactly identifiable -> "no link available", never a guess
+const noLink = (mutate, name) => {
+    const d = { ...ONAIR, ...mutate };
+    const m = decklistMessages(air({ data: { 1: { match1: d } } }), '@viewer');
+    check(`no link when ${name}`, m?.[1] === 'Anu (Rengar): no link available' && m?.[2]?.startsWith('Asc Samdsherman (LeBlanc): https://'), m?.[1]);
+};
+noLink({ 'player-main-deck-left': ONAIR['player-main-deck-left'] + '\n1 Totally Made Up Card' }, 'a card is not in the card database');
+noLink({ 'player-main-deck-left': '' }, 'the board has no main deck');
+noLink({ 'player-champion-left': '' }, 'the champion is missing');
+noLink({ 'player-rune-color-1-left': 'z' }, 'a rune colour is unknown');
+noLink({ 'player-side-deck-left': '4 Brittle Steel' }, 'a sideboard count exceeds the format (4 > 3)');
+noLink({ 'player-main-deck-left': ONAIR['player-main-deck-left'] + '\n13 Pit Rookie' }, 'a main-deck count exceeds the format (>12)');
+check('a token card code cannot be encoded', encodeDeck({ main: [['UNL-T01', 1]], side: [], champion: null }) === null);
+check('near-miss card names never resolve (no fuzzy match)', boardDeck({ ...ONAIR, 'player-main-deck-left': '3 Pit Rooki' }, 'left') === null);
+
+// links only where the match line names decks: not 2v2, FFA, or other games
+for (const [label, extra] of [['2v2', { playerCount: '2v2' }], ['FFA', { playerCount: 'ffa' }], ['MTG', { game: 'mtg' }]]) {
+    const m = decklistMessages(air(extra), '@viewer');
+    check(`${label}: a single message, no links`, m?.length === 1 && !/https?:/.test(m[0]), JSON.stringify(m));
+}
+check('break scene: one message, no links', JSON.stringify(decklistMessages(air({ scene: 'Break - Be Right Back' }), '@viewer')) === JSON.stringify(['@viewer no match is on air right now.']));
+check('can\'t confirm what is on air -> null (quiet)', decklistMessages(air({ inSync: notSynced }), '@viewer') === null);
+
+// sending: in order, stops at the first refusal, and says so on the status page
+let statusH = null;
+const sendApp = { get(path, h) { if (path.endsWith('/status')) statusH = h; }, post() {} };
+const got = [];
+let refuseAt = -1;
+const fake = async (t) => { if (got.length === refuseAt) return { ok: false, reason: 'automod_held' }; got.push(t); return { ok: true }; };
+let bb = initChatBridge(sendApp, io, { connect: false, decklistsCooldownMs: 30000, say: fake,
+    decklistMessages: (mention) => decklistMessages(air(), mention) });
+bb.handle(msg('!decklists', { displayName: 'fan' }));
+await new Promise(r => setTimeout(r, 50));
+check('all three messages sent, in order', got.length === 3 && got[0].startsWith('@fan Match 1:') && got[1].startsWith('Anu (Rengar):') && got[2].startsWith('Asc Samdsherman'), JSON.stringify(got.map(m => m.slice(0, 30))));
+let st = null; statusH({}, { json: (o) => { st = o; } });
+check('status page records a clean delivery', st?.decklists?.lastSend?.ok === true && st.decklists.lastSend.sent === 3, JSON.stringify(st?.decklists?.lastSend));
+check('status page previews all three messages', st?.decklists?.messages?.length === 3, JSON.stringify(st?.decklists?.messages?.map(m => m.slice(0, 30))));
+
+got.length = 0; refuseAt = 1;
+bb = initChatBridge(sendApp, io, { connect: false, decklistsCooldownMs: 30000, say: fake,
+    decklistMessages: (mention) => decklistMessages(air(), mention) });
+bb.handle(msg('!decklists', { displayName: 'fan' }));
+await new Promise(r => setTimeout(r, 50));
+check('stops at the first message Twitch refuses (no orphan player lines)', got.length === 1, `${got.length} sent`);
+statusH({}, { json: (o) => { st = o; } });
+check('a refused reply shows on the status page instead of vanishing',
+    st?.decklists?.lastSend?.ok === false && st.decklists.lastSend.sent === 1 && st.decklists.lastSend.reason === 'automod_held', JSON.stringify(st?.decklists?.lastSend));
+
+// a line that would overflow keeps its words and drops the link, never half a URL
+got.length = 0; refuseAt = -1;
+const huge = `${'W'.repeat(300)} (Rengar): ${BUILDER}${GOLDEN_LEFT}`;
+bb = initChatBridge(sendApp, io, { connect: false, decklistsCooldownMs: 30000, say: fake, decklistMessages: () => ['@fan Match 1: A vs B', huge] });
+bb.handle(msg('!decklists'));
+await new Promise(r => setTimeout(r, 50));
+check('an over-long line never carries a cut link', got[1] === `${'W'.repeat(300)} (Rengar): no link available`, got[1]?.slice(-40));
 
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
