@@ -1971,6 +1971,24 @@ export function initMatches(socket) {
         showdownEl.dispatchEvent(new Event('input', { bubbles: true }));
     });
 
+    // A deck that arrived while the operator had that textarea focused (see
+    // the field-updated handler) waits for them to leave it, so a chat !p1 or
+    // an iPad's saved deck can't replace a list mid-keystroke. If they type in
+    // the meantime, theirs wins and the waiting one is dropped.
+    document.addEventListener('input', (e) => {
+        const el = e.target;
+        if (el && el.tagName === 'TEXTAREA' && el.dataset?.remotePending !== undefined) {
+            delete el.dataset.remotePending;
+        }
+    });
+    // Capture: blur doesn't bubble.
+    document.addEventListener('blur', (e) => {
+        const el = e.target;
+        if (!el || el.tagName !== 'TEXTAREA' || el.dataset?.remotePending === undefined) return;
+        el.value = el.dataset.remotePending;
+        delete el.dataset.remotePending;
+    }, true);
+
     // Delegated handlers for the Riftbound Showdown Might section:
     //   - Visibility toggle button (aria-pressed → showdown-visible field)
     //   - Baron Pit enable checkbox (toggles BF-3 row visibility +
@@ -3894,7 +3912,17 @@ export function initMatches(socket) {
                 // textContent would leave the old list on screen (and the next
                 // edit would send it back).
                 if (fieldElement.tagName === 'TEXTAREA') {
-                    fieldElement.value = Array.isArray(value) ? value.join('\n') : (value ?? '');
+                    const text = Array.isArray(value) ? value.join('\n') : (value ?? '');
+                    if (document.activeElement === fieldElement) {
+                        // The operator is typing in this box. Don't pull it
+                        // out from under them mid-edit: it lands when they
+                        // leave the box, and is dropped if they type (their
+                        // text is then the newer one). See the blur/input
+                        // handlers further down.
+                        fieldElement.dataset.remotePending = text;
+                    } else {
+                        fieldElement.value = text;
+                    }
                 } else {
                     fieldElement.textContent = value;
                 }

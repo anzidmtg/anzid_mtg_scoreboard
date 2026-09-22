@@ -58,13 +58,19 @@ export function transformAndEmitAllDecks(roundId, controlData, io) {
             }
 
             // Side deck
+            // Always sent, empty included — same reason as
+            // get-scoreboard-decklists in sockets/handlers.js: the decklist
+            // pages keep the last sideboard they were given, so a player
+            // without one would otherwise be shown the previous player's.
+            // The empty payload is built here rather than through
+            // transformSideDeckPure, which would rebuild the whole card-name
+            // map to transform nothing.
             const sideDeckRaw = deckLines(matchData[`player-side-deck-${sideID}`]);
-            if (sideDeckRaw.length > 0) {
-                const sidePayload = { deckData: sideDeckRaw, gameType, sideID, matchID };
-                const sideResult = transformSideDeckPure(sidePayload);
-                emitTransformedSideDeck(sideResult.deckData, sideResult.gameType, sideResult.sideID, sideResult.matchID, io);
-                cacheTransform(roundId, matchID, sideID, null, sideResult);
-            }
+            const sideResult = sideDeckRaw.length > 0
+                ? transformSideDeckPure({ deckData: sideDeckRaw, gameType, sideID, matchID })
+                : { deckData: [], gameType, sideID, matchID };
+            emitTransformedSideDeck(sideResult.deckData, sideResult.gameType, sideResult.sideID, sideResult.matchID, io);
+            cacheTransform(roundId, matchID, sideID, null, sideResult);
         }
     }
     console.log(`[Broadcast] Server-side transforms complete for round ${roundId}`);

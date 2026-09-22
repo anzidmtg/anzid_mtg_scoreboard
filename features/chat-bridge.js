@@ -628,8 +628,10 @@ export function initChatBridge(app, io, opts = {}) {
 
         // Admin deck loading. Anyone else's "!p1 …" is just a chat line — no
         // reply advertising a command they can't use, and a [[card]] in it
-        // still works.
-        const deckCmd = isAdmin(msg) && parsePlayerDeckCommand(msg.text);
+        // still works. An admin's line carrying a [[card]] is a card request
+        // too: a deck link never contains one, and the admin would otherwise
+        // be the only person whose card is swallowed.
+        const deckCmd = isAdmin(msg) && !msg.text.includes('[[') && parsePlayerDeckCommand(msg.text);
         if (deckCmd) { if (canPromptOn(msg.platform)) loadPlayerDeck(msg, deckCmd); return; }
 
         // Checked before the card command, and deliberately leaves this
@@ -730,7 +732,7 @@ export function initChatBridge(app, io, opts = {}) {
             ...(s.conn.quotaUsed ? { quotaUsed: s.conn.quotaUsed() } : {}),
         })),
         connected: sources.some(s => s.conn.isConnected()),
-        shownThisStream, cooldownMs: cfg.cooldownMs,
+        shownThisStream, cooldownMs: cfg.cooldownMs, admins: [...admins],
         cooldownRemainingMs: Math.max(0, cfg.cooldownMs - (Date.now() - lastShownAt)),
         slotOwner: slotOwner(CARD_SLOT),
         pendingPrompts: pending.size(),
@@ -754,6 +756,9 @@ export function initChatBridge(app, io, opts = {}) {
         res.json({ live });
     });
 
+    // Named at start-up: a mistyped or empty CHAT_ADMINS turns !p1/!p2 off,
+    // and silently would mean finding out mid-show.
+    log(`admins: ${[...admins].join(', ') || 'NONE — !p1/!p2 are disabled'}`);
     log(`live on #${channel} — cooldown ${cfg.cooldownMs}ms, dwell ${cfg.dwellMs}ms, slot ${CARD_SLOT}`);
     return {
         enabled: true,

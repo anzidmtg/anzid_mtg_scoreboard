@@ -60,19 +60,30 @@ export async function loadPiltoverDeckIntoControl({ round_id, match_id, side, li
     const mine = ++loadsStarted;
     latestLoad.set(slot, mine);
 
+    // A load that writes nothing hands the slot back, so it can't cancel an
+    // older one still in flight: a mistyped second link would otherwise leave
+    // the board with neither deck.
+    const giveUp = (result) => {
+        if (latestLoad.get(slot) === mine) latestLoad.delete(slot);
+        return result;
+    };
+
     let text;
     try {
         text = await fetchText(ref);
     } catch (e) {
-        return { ok: false, ...fetchFailure(e) };
+        return giveUp({ ok: false, ...fetchFailure(e) });
     }
-    if (latestLoad.get(slot) !== mine) return { ok: false, reason: 'superseded' };
-    if (!shouldCommit()) return { ok: false, reason: 'paused' };
+    // Only a load that is still the newest one for this slot writes. A newer
+    // one that gave up (below) has cleared the slot, which lets this one land.
+    const claim = latestLoad.get(slot);
+    if (claim !== undefined && claim > mine) return { ok: false, reason: 'superseded' };
+    if (!shouldCommit()) return giveUp({ ok: false, reason: 'paused' });
 
     const parsed = parseDeckString(text);
     const fields = riftboundDeckFields(parsed, side);
     if (!fields[`player-legend-${side}`] || !fields[`player-main-deck-${side}`]) {
-        return { ok: false, reason: 'not-a-deck' };
+        return giveUp({ ok: false, reason: 'not-a-deck' });
     }
     const all = Object.fromEntries(deckFieldNames(side).map(k => [k, '']));
     Object.assign(all, fields);

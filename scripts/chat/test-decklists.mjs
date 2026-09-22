@@ -487,6 +487,19 @@ check('REVIEW F11: a re-sent bare !p1 gets usage, not a link error', r1.said[0] 
     check('REVIEW F14: a viewer\'s "!p1 … [[card]]" still shows the card', shownNow.length === 1 && /Loose Cannon/.test(shownNow[0]), JSON.stringify(shownNow));
     releaseSlot('3');
 }
+{
+    // AUDIT: …and an admin's, too — the admins were the only people whose card
+    // the command swallowed
+    releaseSlot('3');
+    const shownNow = [], said = [];
+    const ioC = { emit: (ev, d) => { if (ev === 'chat-card-shown') shownNow.push(d.name); }, to: () => ({ emit() {} }), sockets: { emit() {} } };
+    const br = initChatBridge(app, ioC, { connect: false, cooldownMs: 0, dwellMs: 60000, say: async (t) => { said.push(t); }, describeOnAir: describe,
+        deckTarget: () => MATCH1, loadPlayerDeck: async () => { throw new Error('must not load'); } });
+    br.handle({ platform: 'twitch', userId: 'a14', login: 'anzidmtg', displayName: 'anzidmtg', text: '!p1 [[Loose Cannon]]' });
+    await settle();
+    check('AUDIT: an admin\'s "!p1 [[card]]" shows the card instead of a link error', shownNow.length === 1 && /Loose Cannon/.test(shownNow[0]) && said.length === 0, JSON.stringify([shownNow, said]));
+    releaseSlot('3');
+}
 r1 = await adminRun({ text: `!p1 ${VIEW}`, game: 'mtg' });
 check('!p1 during an MTG show explains it is Riftbound-only', r1.calls.length === 0 && /only works for Riftbound/.test(r1.said[0] || ''), r1.said[0]);
 r1 = await adminRun({ text: `!p1 ${VIEW}`, bridge: { admins: ['someoneelse'] } });
@@ -683,6 +696,57 @@ check('the !decklists window is 1 minute', _internal.DEFAULTS?.decklistsCooldown
     // REVIEW F1: the kill switch hit while Piltover is answering -> nothing written
     const paused = await loadPiltoverDeckIntoControl({ ...at, side: 'left', link: VIEW, fetchText: async () => PA_TEXT, shouldCommit: () => false });
     check('REVIEW F1: shouldCommit false after the fetch -> paused, nothing written', paused.reason === 'paused' && control.getControlData()['1'].match1['player-legend-left'] === 'Rengar, Pridestalker', JSON.stringify(paused));
+
+    // AUDIT: a load that writes nothing hands its slot back, so a mistyped
+    // second link can't cancel the good one still in flight
+    let releaseGood;
+    const good = loadPiltoverDeckIntoControl({ ...at, side: 'left', link: VIEW, fetchText: () => new Promise(r => { releaseGood = () => r(OTHER); }) });
+    const typo = await loadPiltoverDeckIntoControl({ ...at, side: 'left', link: VIEW, fetchText: async () => { const e = new Error('nf'); e.response = { status: 404 }; throw e; } });
+    releaseGood();
+    const goodRes = await good;
+    check('AUDIT: a failed !p1 does not cancel the good one still in flight', typo.reason === 'not-found' && goodRes.ok && control.getControlData()['1'].match1['player-legend-left'] === 'Rengar, Pridestalker', JSON.stringify([typo, goodRes]));
+
+    // AUDIT: when the guard keeps the server's value, master control is TOLD —
+    // so the operator sees it, and their next copy is no longer refused
+    await control.updateFieldsFromServer('1', 'match1', { 'player-champion-left': 'Bot Champion' }, ioL);
+    const blind = JSON.parse(JSON.stringify(control.getControlData()['1'].match1));   // a copy that never heard it
+    blind['player-champion-left'] = 'Operator Champion';
+    delete blind._timestamps['player-champion-left'];
+    emits.length = 0;
+    await control.updateFromMaster({ 1: { match1: blind } }, ioL);
+    const told = emits.filter(e => e.ev === 'field-updated' && e.d.field === 'player-champion-left');
+    check('AUDIT: an overridden field is sent back to master control', told.length === 1 && told[0].d.value === 'Bot Champion' && told[0].room === 'master-control', JSON.stringify(told.map(e => [e.room, e.d.value])));
+    check('AUDIT: …the server keeps its value for that one edit', control.getControlData()['1'].match1['player-champion-left'] === 'Bot Champion');
+    // master control applies that field-updated (its timestamp is newer), so its next copy carries it
+    blind._timestamps['player-champion-left'] = told[0].d.timestamp;
+    blind['player-champion-left'] = 'Operator Champion 2';
+    await control.updateFromMaster({ 1: { match1: blind } }, ioL);
+    check('AUDIT: …and the operator\'s next edit lands, the guard is done', control.getControlData()['1'].match1['player-champion-left'] === 'Operator Champion 2', control.getControlData()['1'].match1['player-champion-left']);
+}
+
+// ── 12. a player with no sideboard ───────────────────────────────────────────
+// The pages keep the last sideboard they were given, so both deck paths must
+// say "this player has none" out loud rather than skipping the message.
+{
+    const { transformAndEmitAllDecks } = await import('../../features/transformAllDecks.js');
+    const noSide = { 1: { match1: {
+        'player-legend-left': 'Rengar, Pridestalker', 'player-champion-left': 'Rengar, Trophy Hunter',
+        'player-main-deck-left': '3 Pit Rookie', 'player-side-deck-left': '',
+        'player-legend-right': 'LeBlanc, Deceiver', 'player-champion-right': 'LeBlanc, Fragmented',
+        'player-main-deck-right': '3 Stupefy', 'player-side-deck-right': '2 Salvage',
+    } } };
+    const out = [];
+    const ioD = { to: (room) => ({ emit: (ev, d) => out.push({ room, ev, d }) }), emit: (ev, d) => out.push({ room: '*', ev, d }) };
+    transformAndEmitAllDecks('1', noSide, ioD);
+    const sides = out.filter(e => e.ev === 'transformed-side-deck-data').map(e => [e.d.sideID, e.d.deckData.length]);
+    check('Broadcast: a player with no sideboard is sent an empty one, not nothing',
+        JSON.stringify(sides.filter(s => s[0] === 'left')[0]) === JSON.stringify(['left', 0]), JSON.stringify(sides));
+    check('Broadcast: the other player\'s sideboard still goes out',
+        JSON.stringify(sides.filter(s => s[0] === 'right')[0]) === JSON.stringify(['right', 1]), JSON.stringify(sides));
+    const { getCachedTransform } = await import('../../features/transformCache.js');
+    const cached = getCachedTransform('match1', 'left');
+    check('Broadcast: the empty sideboard is cached, so a page that loads late gets it too',
+        !!cached?.side && Array.isArray(cached.side.deckData) && cached.side.deckData.length === 0, JSON.stringify(cached && Object.keys(cached)));
 }
 rmSync(process.env.CONTROL_DATA_PATH, { force: true });
 check('the real data/controlData.json was never touched', realHash() === REAL_BEFORE);

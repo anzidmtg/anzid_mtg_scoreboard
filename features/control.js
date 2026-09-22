@@ -330,6 +330,8 @@ export function emitControlTrackers(io) {
 
 // Emit a full update from master control - goes to control / scoreboard
 export async function updateFromMaster(allControlData, io) {
+    // Fields this merge kept the server's value for (see serverWrites).
+    const overridden = [];
     // Merge incoming data with existing data to preserve draft list fields
     Object.entries(allControlData).forEach(([round_id, roundData]) => {
         if (isNaN(round_id)) return; // Skip non-round keys like "draftLists"
@@ -351,8 +353,10 @@ export async function updateFromMaster(allControlData, io) {
                 for (const [field, ts] of written) {
                     if ((seen[field] || 0) >= ts) { written.delete(field); continue; }
                     if (!(field in matchData)) continue;
+                    const kept = existing._timestamps?.[field] ?? ts;
                     merged[field] = existing[field];
-                    merged._timestamps = { ...(merged._timestamps || {}), [field]: existing._timestamps?.[field] ?? ts };
+                    merged._timestamps = { ...(merged._timestamps || {}), [field]: kept };
+                    overridden.push({ round_id, match_id, field, value: existing[field], timestamp: kept });
                 }
                 if (!written.size) serverWrites.delete(key);
             }
@@ -366,6 +370,11 @@ export async function updateFromMaster(allControlData, io) {
             }
         });
     });
+    // Master control is holding a value the server has just refused. Send back
+    // what was kept so its screen corrects itself rather than silently
+    // disagreeing with the scoreboard — and so the copy it sends next carries
+    // the right timestamp, which lets the guard go.
+    overridden.forEach(p => RoomUtils.emitWithRoomMapping(io, 'field-updated', p));
     await saveControlData();
 
     Object.entries(allControlData).forEach(([round_id, roundData]) => {
