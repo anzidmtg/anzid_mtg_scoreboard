@@ -15,6 +15,11 @@
 //   5s              7,200      7,200      72%   <- our default, covers a long day
 //   6s              6,000      6,000      60%   <- headroom for two shows a day
 //
+// Those are worst-case rows: the reader only polls while a chat is actually
+// live, and it slows to IDLE_POLL_MS when nobody is talking (see nextPollMs),
+// so a real 4-6 hour show costs well under its row. A 6h show at 5s is ~4,300
+// units even if chat never goes quiet.
+//
 // The API's own pollingIntervalMillis drops to ~1s on a busy chat, which would
 // burn the whole day's quota in under three hours and kill the feature
 // mid-show. So we honour that hint only when it is SLOWER than our floor.
@@ -48,6 +53,14 @@ const OFFLINE_MS = 60000;       // nothing live, video pinned: 1 unit a try
 // live can take up to 15 minutes to notice; YOUTUBE_VIDEO_ID is instant.
 const DISCOVERY_MS = 15 * 60 * 1000;
 const DAILY_SEARCHES = 90;
+// Chat is not busy for most of a show. Reading every few seconds through an
+// hour of silence spends the same quota as reading through an hour of a packed
+// chat, and buys nothing — so the reader slows down when nobody is talking and
+// speeds back up on the first message. That is what makes a fast interval
+// affordable across a long day.
+const IDLE_POLL_MS = 10000;      // after QUIET_AFTER_MS with nothing said
+const QUIET_AFTER_MS = 120000;
+const PAUSED_POLL_MS = 60000;    // kill switch is off: nothing acts on chat anyway
 
 const log = (m) => console.log(`[youtube-live] ${m}`);
 
@@ -67,6 +80,16 @@ async function api(path, params, key) {
     return r.json();
 }
 
+// How long to wait before the next read. Pure, so the pacing can be tested
+// without the network: see scripts/chat/test-decklists.mjs.
+export function nextPollMs({ floorMs, gotMessages, quietMs, paused = false, apiHintMs = 0 }) {
+    if (paused) return PAUSED_POLL_MS;
+    const mine = gotMessages || quietMs < QUIET_AFTER_MS ? floorMs : Math.max(floorMs, IDLE_POLL_MS);
+    // YouTube's own hint is honoured only when it asks us to go SLOWER: it
+    // drops to ~1s on a busy chat, which would burn the day in under 3 hours.
+    return Math.max(mine, apiHintMs || 0);
+}
+
 /**
  * Read the live chat of a broadcast.
  *
@@ -80,7 +103,8 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     // and torch the day's quota in ten minutes.
     const floorMs = Math.max(MIN_POLL_MS, Number(pollMs) || DEFAULT_POLL_MS);
     let stopped = false, liveChatId = null, pageToken = null;
-    let connected = false, timer = null, primed = false;
+    let connected = false, timer = null, primed = false, paused = false;
+    let lastMessageAt = Date.now();
     let used = 0, searches = 0, day = new Date().toDateString();
     const seen = new Set();          // liveChatMessageId, guards the first-page backlog
 
@@ -128,6 +152,10 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     async function poll() {
         if (stopped) return;
         let waitMs = floorMs;
+        // Paused by the kill switch: nothing would act on a message anyway, so
+        // stop paying for reads. Kept ticking slowly rather than stopped, so
+        // resuming does not have to re-resolve the chat.
+        if (paused) { timer = setTimeout(poll, PAUSED_POLL_MS); timer.unref?.(); return; }
         try {
             if (!liveChatId) await resolveChat();
 
@@ -151,11 +179,13 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
                 // swallow the first real messages of the show as well.
                 const first = !primed;
                 primed = true;
+                let fresh = 0;
                 for (const it of j.items || []) {
                     const id = it.id;
                     if (!id || seen.has(id)) continue;
                     seen.add(id);
                     if (first) continue;        // don't replay backlog on connect
+                    fresh++;
                     const s = it.snippet || {}, a = it.authorDetails || {};
                     if (s.type !== 'textMessageEvent') continue;
                     const roles = new Set();
@@ -174,8 +204,11 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
                 }
                 if (seen.size > 5000) for (const k of [...seen].slice(0, 2500)) seen.delete(k);
 
-                // Honour the API's hint only when it asks us to go SLOWER.
-                waitMs = Math.max(floorMs, Number(j.pollingIntervalMillis) || 0);
+                if (fresh) lastMessageAt = Date.now();
+                waitMs = nextPollMs({
+                    floorMs, gotMessages: fresh, quietMs: Date.now() - lastMessageAt,
+                    paused, apiHintMs: Number(j.pollingIntervalMillis) || 0,
+                });
             }
         } catch (e) {
             connected = false;
@@ -199,6 +232,13 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
     return {
         stop() { stopped = true; clearTimeout(timer); connected = false; onStatus('stopped'); },
         isConnected: () => connected,
+        // The bridge's kill switch calls this: a paused bot should not spend
+        // the day's quota reading chat it will ignore.
+        setPaused(p) {
+            const was = paused;
+            paused = !!p;
+            if (was && !paused) { clearTimeout(timer); lastMessageAt = Date.now(); poll(); }
+        },
         quotaUsed: () => used,
         // Its own daily bucket, and the one that decides whether channelId mode
         // can still find a stream today — so it is worth seeing separately.

@@ -756,6 +756,9 @@ export function initChatBridge(app, io, opts = {}) {
         live = req.params.state === 'on';
         log(`kill switch: ${live ? 'LIVE' : 'PAUSED'}`);
         if (!live) { pending.shutdown(); waiting.clear(); clearTimeout(drainTimer); drainTimer = null; clearSlot(); }
+        // A paused bot ignores every message, so a source that pays per read
+        // (YouTube, by quota) should stop paying until it is live again.
+        for (const s of sources) { try { s.conn.setPaused?.(!live); } catch (e) { log(`${s.name}: ${e && e.message}`); } }
         res.json({ live });
     });
 

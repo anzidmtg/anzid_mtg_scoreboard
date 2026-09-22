@@ -194,8 +194,21 @@ unit each, and `search.list` as its own ~100-calls/day bucket.
 | **5s** | **7,200** | **7,200** | **72% — default** |
 | 6s | 6,000 | 6,000 | 60% — room for two shows |
 
+Those rows are worst case. The reader only polls while a chat is actually live,
+slows to one read every 10s when nobody has spoken for two minutes, and drops to
+one a minute while the kill switch is off — so a real 4-6 hour show costs well
+under its row. A 6-hour show at 5s is ~4,300 units even if chat never goes quiet,
+which leaves room for a second show the same day.
+
 The adapter stops itself at 9,000 units and pauses until the counter resets, so
-a too-fast interval costs you the END of the show, quietly. `sources[].quotaUsed`
+a too-fast interval costs you the END of the show, quietly.
+
+**If you ever do need more than 10,000/day**, the only legitimate route is
+Google's "YouTube API Services - Audit and Quota Extension" form: a compliance
+audit of the whole app, measured in weeks, and usually aimed at products rather
+than one channel's overlay. Spreading load across several Cloud projects is
+expressly against the YouTube API Terms of Service and risks the key being
+revoked — don't. `sources[].quotaUsed`
 and `sources[].searchesUsed` on the status endpoint are the two numbers to
 watch; Cloud Console → APIs & Services → Quotas shows Google's own view.
 

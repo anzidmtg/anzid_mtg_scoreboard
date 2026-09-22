@@ -752,5 +752,31 @@ check('the !decklists window is 1 minute', _internal.DEFAULTS?.decklistsCooldown
 rmSync(process.env.CONTROL_DATA_PATH, { force: true });
 check('the real data/controlData.json was never touched', realHash() === REAL_BEFORE);
 
+// ── 13. YouTube read pacing (what the daily quota actually buys) ─────────────
+{
+    const { nextPollMs } = await import('../../features/chat/youtube-live.js');
+    const floorMs = 5000;
+    check('pacing: chat is talking -> the operator\'s interval',
+        nextPollMs({ floorMs, gotMessages: 2, quietMs: 0 }) === 5000);
+    check('pacing: a short lull still reads at the operator\'s interval',
+        nextPollMs({ floorMs, gotMessages: 0, quietMs: 30000 }) === 5000);
+    check('pacing: two minutes of silence -> slow down, stop paying for nothing',
+        nextPollMs({ floorMs, gotMessages: 0, quietMs: 150000 }) === 10000);
+    check('pacing: a message after the lull -> straight back to speed',
+        nextPollMs({ floorMs, gotMessages: 1, quietMs: 150000 }) === 5000);
+    check('pacing: paused by the kill switch -> barely read at all',
+        nextPollMs({ floorMs, gotMessages: 5, quietMs: 0, paused: true }) === 60000);
+    check('pacing: YouTube asking for SLOWER is obeyed',
+        nextPollMs({ floorMs, gotMessages: 1, quietMs: 0, apiHintMs: 8000 }) === 8000);
+    check('pacing: YouTube asking for faster is not (it would burn the day by lunch)',
+        nextPollMs({ floorMs, gotMessages: 1, quietMs: 0, apiHintMs: 1000 }) === 5000);
+    check('pacing: an operator floor slower than idle is never sped up',
+        nextPollMs({ floorMs: 15000, gotMessages: 0, quietMs: 150000 }) === 15000);
+    // what a real show costs: the number the user actually asked about
+    const units = (hours, ms) => Math.round((hours * 3600 * 1000) / ms);
+    check('a 6-hour show at 5s fits the daily pool with room to spare', units(6, 5000) === 4320 && units(6, 5000) < 9000, `${units(6, 5000)} units`);
+    check('a 6-hour show at 3s still fits', units(6, 3000) === 7200 && units(6, 3000) < 9000, `${units(6, 3000)} units`);
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
