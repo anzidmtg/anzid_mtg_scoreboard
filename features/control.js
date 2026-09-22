@@ -189,7 +189,53 @@ export async function updateFromControl(round_id, match_id, newState, io) {
     emitControlData(io);
 }
 
+// Fields the server wrote itself (updateFieldsFromServer), kept until master
+// control shows it has them. Master sends its whole copy of every match on each
+// edit, so a copy sent before it heard about a server write would put the old
+// value straight back. Its copy carries the _timestamps it has seen: once a
+// field's is at least the server write's, master has caught up.
+//   "<round>|<match>" -> Map(field -> timestamp)
+const serverWrites = new Map();
+const serverWriteKey = (round_id, match_id) => `${round_id}|${match_id}`;
+
 // NEW: Update a single field from control - granular updates
+// Several fields at once, set by the server itself (the chat bot's !p1/!p2
+// loading a Piltover deck). Same effect as a master-control edit: stored,
+// master-control told field by field (it keeps its own copy of every match and
+// sends all of it back on its next edit), and control pages + scoreboards
+// pushed the new state — but one save and one push, not one per field.
+export async function updateFieldsFromServer(round_id, match_id, fields, io) {
+    if (!controlData[round_id]) controlData[round_id] = {};
+    if (!controlData[round_id][match_id]) controlData[round_id][match_id] = {};
+    const match = controlData[round_id][match_id];
+    if (!match._timestamps) match._timestamps = {};
+    const key = serverWriteKey(round_id, match_id);
+    if (!serverWrites.has(key)) serverWrites.set(key, new Map());
+    const now = Date.now();
+    for (const [field, value] of Object.entries(fields)) {
+        // Newer than anything stored: timestamps come from clients' clocks too,
+        // and one running ahead of the server's must not make this lose the
+        // "only if newer" check here or in master-control.
+        const timestamp = Math.max(now, (match._timestamps[field] || 0) + 1);
+        match[field] = value;
+        match._timestamps[field] = timestamp;
+        serverWrites.get(key).set(field, timestamp);
+        // Before the save, so master control hears as early as possible.
+        RoomUtils.emitWithRoomMapping(io, 'field-updated', { round_id, match_id, field, value, timestamp });
+    }
+    await saveControlData();
+    // Read the match again: a master-control update during the save replaces
+    // the object, and what goes on air must be what the server now holds.
+    const data = controlData[round_id]?.[match_id] || {};
+    Object.entries(controlsTracker).forEach(([control_id, ctrl]) => {
+        if (ctrl.round_id !== round_id || ctrl.match_id !== match_id) return;
+        const payload = { data, round_id, match_id, archetypeList: getSortedArchetypes() };
+        RoomUtils.emitToRoom(io, `control-${control_id}`, `control-${control_id}-saved-state`, payload);
+        noteScoreboardPushed(control_id);
+        RoomUtils.emitToRoom(io, `scoreboard-${control_id}`, `scoreboard-${control_id}-saved-state`, payload);
+    });
+}
+
 export async function updateFieldFromControl(round_id, match_id, field, value, timestamp, io) {
     if (!controlData[round_id]) controlData[round_id] = {};
     if (!controlData[round_id][match_id]) controlData[round_id][match_id] = {};
@@ -294,7 +340,23 @@ export async function updateFromMaster(allControlData, io) {
             const existingDraftListLeft = controlData[round_id][match_id]['player-draft-list-left'];
             const existingDraftListRight = controlData[round_id][match_id]['player-draft-list-right'];
             // Merge new data
-            controlData[round_id][match_id] = { ...controlData[round_id][match_id], ...matchData };
+            const existing = controlData[round_id][match_id];
+            const merged = { ...existing, ...matchData };
+            // A field the server wrote that this copy predates keeps the
+            // server's value (see serverWrites).
+            const key = serverWriteKey(round_id, match_id);
+            const written = serverWrites.get(key);
+            if (written && matchData && typeof matchData === 'object') {
+                const seen = matchData._timestamps || {};
+                for (const [field, ts] of written) {
+                    if ((seen[field] || 0) >= ts) { written.delete(field); continue; }
+                    if (!(field in matchData)) continue;
+                    merged[field] = existing[field];
+                    merged._timestamps = { ...(merged._timestamps || {}), [field]: existing._timestamps?.[field] ?? ts };
+                }
+                if (!written.size) serverWrites.delete(key);
+            }
+            controlData[round_id][match_id] = merged;
             // Restore draft list fields if they existed and weren't in incoming data
             if (existingDraftListLeft && !matchData['player-draft-list-left']) {
                 controlData[round_id][match_id]['player-draft-list-left'] = existingDraftListLeft;

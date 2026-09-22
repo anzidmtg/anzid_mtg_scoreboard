@@ -944,10 +944,13 @@ export default function registerSocketHandlers(io) {
                 try {
                     const main = transformMainDeckPure(buildMainDeckPayload(matchData, sideID, gameType, match_id));
                     socket.emit('transformed-main-deck-data', main);
+                    // Always sent, empty included: the page keeps the last
+                    // sideboard it was given, so a new deck with none would
+                    // otherwise show the previous player's.
                     const sideRaw = deckLines(matchData[`player-side-deck-${sideID}`]);
-                    if (sideRaw.length > 0) {
-                        socket.emit('transformed-side-deck-data', transformSideDeckPure({ deckData: sideRaw, gameType, sideID, matchID: match_id }));
-                    }
+                    socket.emit('transformed-side-deck-data', sideRaw.length > 0
+                        ? transformSideDeckPure({ deckData: sideRaw, gameType, sideID, matchID: match_id })
+                        : { deckData: [], gameType, sideID, matchID: match_id });
                 } catch (e) {
                     console.error(`[Scoreboard decklists] transform failed for ${round_id}/${match_id}/${sideID}:`, e.message);
                 }

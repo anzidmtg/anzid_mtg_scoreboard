@@ -3889,7 +3889,23 @@ export function initMatches(socket) {
             // Update ONLY the specific field in DOM
             const fieldElement = document.getElementById(`${round_id}-${match_id}-${field}`);
             if (fieldElement) {
-                fieldElement.textContent = value;
+                // The deck lists are textareas that renderMatch filled with
+                // .value, and a textarea shows .value from then on — setting
+                // textContent would leave the old list on screen (and the next
+                // edit would send it back).
+                if (fieldElement.tagName === 'TEXTAREA') {
+                    fieldElement.value = Array.isArray(value) ? value.join('\n') : (value ?? '');
+                } else {
+                    fieldElement.textContent = value;
+                }
+            }
+            // A deck arriving from elsewhere (the chat bot's !p1 / !p2, an
+            // iPad's saved deck) opens that player's deck section, as the Add
+            // Decklist import does.
+            const mainDeckSide = field.match(/^player-main-deck-(.+)$/);
+            if (mainDeckSide && String(Array.isArray(value) ? value.join('') : (value ?? '')).trim()) {
+                const deckFields = document.getElementById(`${round_id}-${match_id}-deck-fields-${mainDeckSide[1]}`);
+                if (deckFields) deckFields.style.display = 'block';
             }
 
             // Mirror admin-driven RIFTBOUND changes onto master-control's DERIVED

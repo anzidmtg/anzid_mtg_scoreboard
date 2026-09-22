@@ -8,7 +8,9 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
 // === File Paths ===
-export const controlDataPath     = path.join(rootDir, 'data', 'controlData.json');
+// CONTROL_DATA_PATH lets a test point saves at a scratch file instead of the
+// real match data (scripts/chat/test-decklists.mjs does). Unset in production.
+export const controlDataPath     = process.env.CONTROL_DATA_PATH || path.join(rootDir, 'data', 'controlData.json');
 export const bracketDataPath     = path.join(rootDir, 'data', 'bracketData.json');
 export const standingsDataPath   = path.join(rootDir, 'data', 'standingsData.json');
 export const archetypeListPath   = path.join(rootDir, 'data', 'archetypeList.json');

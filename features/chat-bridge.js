@@ -31,6 +31,12 @@
 // match OBS has on program, reading the same data that match's header is
 // showing, and only once that header has been sent this server's data since
 // boot. Anything it can't vouch for, it says nothing about.
+//
+//   admin:   !p1 https://piltoverarchive.com/decks/view/<id>
+//   bot:     @admin Player 1 (Match 1) now has Kennen, Heart of the Tempest — 40 cards, 10 in the sideboard.
+//
+// Admins only (DEFAULTS.admins, Twitch): loads a Piltover deck onto that
+// player in the match on program, as master control's Add Decklist would.
 
 import { emitCardView } from './cards.js';
 import { getGameSelection, getPlayerCount } from '../config/constants.js';
@@ -38,6 +44,7 @@ import { getControlsTracker, getControlData, getBroadcastTracker, isScoreboardIn
 import { getCurrentProgramScene } from './obs-websocket.js';
 import { findRiftboundCard } from './riftbound/cards.js';
 import { verifiedDeckCode, PILTOVER_BUILDER } from './riftbound/deck-code.js';
+import { loadPiltoverDeckIntoControl } from './riftbound/load-piltover-deck.js';
 import { connectTwitchChat } from './chat/twitch-irc.js';
 import { connectYouTubeChat } from './chat/youtube-live.js';
 import { resolveCardName } from './chat/resolve.js';
@@ -60,7 +67,13 @@ const DEFAULTS = {
     // !decklists answers everyone at once, so one reply per window is plenty —
     // the matchup changes between games, not between chat messages. Requests
     // inside the window are dropped silently: a raid gets one answer, not 200.
-    decklistsCooldownMs: 30000,
+    // A reply is four messages, so this also caps the bot at 4 a minute.
+    decklistsCooldownMs: 60000,
+    // Twitch logins that skip every cooldown and can use !p1 / !p2. Matched on
+    // the login Twitch itself puts on each message, which can't be spoofed —
+    // and only on Twitch: YouTube names are free text. Override with
+    // CHAT_ADMINS in .env (comma-separated).
+    admins: ['anzidmtg', 'notveryrichard'],
     // Every !decklists reply ends with this: the operator's "stream decklists"
     // Google Doc, public to anyone with the link. It is also what a viewer gets
     // when the bot can't confirm what is on air, rather than silence. Override
@@ -91,6 +104,15 @@ function parseCommand(text) {
     const brackets = s.match(/\[\[\s*(.{2,80}?)\s*\]\]/);
     if (brackets) return brackets[1].trim();
     return null;
+}
+
+// "!p1 <link>" | "!p2 <link>" -> { player, side, link }. Admin-only (see
+// handleInner): loads a Piltover deck onto that player's slot in the match on
+// program (see deckTarget). P1 is the left player, as master control labels it.
+function parsePlayerDeckCommand(text) {
+    const m = String(text ?? '').trim().match(/^!p([12])(?:\s+([\s\S]*))?$/i);
+    if (!m) return null;
+    return { player: Number(m[1]), side: m[1] === '1' ? 'left' : 'right', link: (m[2] || '').trim() };
 }
 
 // "!decklists" | "!decklist" | "!decks" — the bare command only. Anything after
@@ -270,6 +292,32 @@ export function readOnAir({
     return lines.length ? { text: lines.join(' | '), decks, live: true } : { text: "the players aren't on the scoreboard yet.", decks: [] };
 }
 
+// Where !p1 / !p2 load a deck: the match OBS has on program, by the same table
+// as !decklists.
+//   Match 1 on program -> Control 1's match (its header follows it live)
+//   Match 2 on program -> match2 of the Broadcast round; its header only
+//                         changes when Broadcast is pressed, so the reply says to
+//   anything else      -> Match 1, and the reply says why
+// Returns { round_id, match_id, label, broadcast, note } or { refuse }.
+export function deckTarget({
+    scene = getCurrentProgramScene(),
+    tracker = getControlsTracker(), broadcast = getBroadcastTracker(),
+} = {}) {
+    const live = scene ? ON_AIR.filter(m => m.scene.test(scene)) : [];
+    if (live.length > 1) return { refuse: "both matches are on program, so I can't tell which one you mean." };
+    const m = live[0] || ON_AIR.find(o => o.label === 'Match 1');
+    const note = live.length ? null
+        : scene ? 'No match is on program, so it went to Match 1.'
+        : "I can't see OBS right now, so it went to Match 1.";
+    if (m.from === 'control') {
+        const { round_id, match_id } = tracker?.[m.control] || {};
+        return { round_id, match_id, label: m.label, broadcast: false, note };
+    }
+    const round_id = broadcast?.round_id;
+    if (round_id == null) return { refuse: `${m.label} is on program, but nothing has been broadcast since the server started — press Broadcast, then try again.` };
+    return { round_id: String(round_id), match_id: m.match, label: m.label, broadcast: true, note };
+}
+
 // The match line on its own (the first message of a reply), or null.
 export function describeOnAir(opts) {
     const r = readOnAir(opts);
@@ -304,7 +352,15 @@ export function initChatBridge(app, io, opts = {}) {
 
     // .env is read here, at start-up, like the rest of the bridge's settings.
     const envLists = process.env.DECKLISTS_DOC_URL;
-    const cfg = { ...DEFAULTS, ...(envLists !== undefined ? { listsUrl: envLists.trim() } : {}), ...opts };
+    const envAdmins = process.env.CHAT_ADMINS;
+    const cfg = {
+        ...DEFAULTS,
+        ...(envLists !== undefined ? { listsUrl: envLists.trim() } : {}),
+        ...(envAdmins !== undefined ? { admins: envAdmins.split(',') } : {}),
+        ...opts,
+    };
+    const admins = new Set((cfg.admins || []).map(a => String(a).trim().toLowerCase()).filter(Boolean));
+    const isAdmin = (msg) => msg.platform === 'twitch' && admins.has(String(msg.login || '').toLowerCase());
     // Sending is optional: with no Twitch app credentials the bridge still
     // reads chat and shows cards, it just can't post disambiguation prompts
     // (ambiguous names then fall through to the timeout auto-pick).
@@ -352,11 +408,54 @@ export function initChatBridge(app, io, opts = {}) {
         return `${Array.from(m).slice(0, MAX_REPLY - 1).join('')}…`;
     }
 
+    const loadDeck = opts.loadPlayerDeck || ((args) => loadPiltoverDeckIntoControl({ ...args, io }));
+    const resolveDeckTarget = opts.deckTarget || (() => deckTarget());
+
+    // !p1 / !p2 from an admin: load a Piltover deck onto the left / right
+    // player of the match on program (deckTarget). Every outcome gets a reply,
+    // so the admin knows whether it landed — unless the kill switch was hit
+    // meanwhile: then nothing is written and nothing is said.
+    function loadPlayerDeck(msg, cmd) {
+        const who = `@${msg.displayName}`;
+        const tell = (text) => (live ? say(`${who} ${text}`).catch(() => {}) : Promise.resolve());
+        const cmdName = `!p${cmd.player}`;
+        if (getGameSelection() !== 'riftbound') { tell(`${cmdName} only works for Riftbound.`); return; }
+        if (!cmd.link) { tell(`usage: ${cmdName} <Piltover Archive deck link>`); return; }
+        const target = resolveDeckTarget();
+        if (target.refuse) { log(`admin ${msg.login}: ${cmdName} refused — ${target.refuse}`); tell(target.refuse); return; }
+        const where = target.broadcast ? `${target.label}, round ${target.round_id}` : target.label;
+        (async () => {
+            const r = await loadDeck({ round_id: target.round_id, match_id: target.match_id, side: cmd.side, link: cmd.link, shouldCommit: () => live });
+            if (r.ok) {
+                const sb = r.sideboard ? `, ${r.sideboard} in the sideboard` : '';
+                log(`admin ${msg.login}: P${cmd.player} deck -> ${r.legend} (round ${r.round_id}, ${r.match_id})`);
+                await tell(`Player ${cmd.player} (${where}) now has ${plainText(r.legend)} — ${r.cards} cards${sb}.${target.note ? ` ${target.note}` : ''}`);
+                // Match 2's header shows the Broadcast round as it was when
+                // Broadcast was last pressed.
+                if (target.broadcast) await tell(`press Broadcast to put it on the ${target.label} header.`);
+                return;
+            }
+            log(`admin ${msg.login}: P${cmd.player} deck not loaded (${r.reason}${r.status ? ` ${r.status}` : ''}${r.detail ? `: ${r.detail}` : ''})`);
+            const why = {
+                'not-piltover': "that isn't a Piltover Archive deck link. Use one like https://piltoverarchive.com/decks/view/<id>",
+                'not-found': "Piltover couldn't find that deck — is it public, and not a draft?",
+                'bad-link': "Piltover says that isn't a valid deck — check the link is complete.",
+                'not-configured': "the server's Piltover API key is missing or was rejected (PILTOVER_API_KEY in .env), so decks can't be loaded.",
+                'fetch-failed': `couldn't get that deck from Piltover${r.status ? ` (${r.status})` : ''} — try again.`,
+                'not-a-deck': 'that Piltover deck has no legend or main deck.',
+                'no-match': `${where} isn't set up in master control.`,
+                'superseded': `not loaded — a newer ${cmdName} for that player replaced it.`,
+            }[r.reason];
+            if (r.reason === 'paused') return;
+            tell(why || 'that deck could not be loaded.');
+        })().catch((e) => { log(`admin deck load failed: ${e && e.message}`); tell('that deck could not be loaded.'); });
+    }
+
     function answerDecklists(msg) {
         // Nothing to do where we can't post (YouTube is read-only), and brand
         // new accounts are ignored exactly as they are for !card.
         if (!canPromptOn(msg.platform) || msg.firstMsg) return;
-        if (Date.now() - lastDecklistsAt < cfg.decklistsCooldownMs) return;
+        if (!isAdmin(msg) && Date.now() - lastDecklistsAt < cfg.decklistsCooldownMs) return;
         // Read BEFORE spending the window, so a read that throws leaves the
         // next viewer free to ask. "Can't tell" still spends it: during a raid
         // that is one quiet check per window, not one per message.
@@ -510,6 +609,12 @@ export function initChatBridge(app, io, opts = {}) {
         if (!live) return;
         if (!msg || typeof msg !== 'object') return;
         if (typeof msg.text !== 'string' || !msg.userId) return;
+        // Chat clients make a repeated message unique so Twitch will accept it
+        // again: 7TV and Chatterino add " \u{E0000}", others U+034F. Invisible
+        // and never part of a command — without this, re-sending "!p1 <link>"
+        // after an error is read as a broken link, and a second "!decklists"
+        // as no command at all.
+        msg = { ...msg, text: msg.text.replace(/[\p{Cf}͏\u{E0000}-\u{E007F}]/gu, '').trim() };
         // The IRC reader is anonymous, so it hears the bot's own messages too.
         // Those are never requests — and a !decklists reply carries scoreboard
         // text, which must not be able to put a card on air.
@@ -520,6 +625,12 @@ export function initChatBridge(app, io, opts = {}) {
         // collide and let one viewer resolve another's prompt.
         const key = `${msg.platform}:${msg.userId}`;
         if (pending.tryPick(key, msg.text)) return;
+
+        // Admin deck loading. Anyone else's "!p1 …" is just a chat line — no
+        // reply advertising a command they can't use, and a [[card]] in it
+        // still works.
+        const deckCmd = isAdmin(msg) && parsePlayerDeckCommand(msg.text);
+        if (deckCmd) { if (canPromptOn(msg.platform)) loadPlayerDeck(msg, deckCmd); return; }
 
         // Checked before the card command, and deliberately leaves this
         // viewer's open card prompt alone — asking who's playing is not a new
@@ -544,7 +655,7 @@ export function initChatBridge(app, io, opts = {}) {
         if (hit.contentWarning) { log(`blocked (content warning): ${hit.name}`); return; }
 
         const since = Date.now() - lastShownAt;
-        if (since < cfg.cooldownMs) {
+        if (since < cfg.cooldownMs && !isAdmin(msg)) {
             // Park it for the next window instead of dropping it. One slot per
             // platform: the most recent request from a platform replaces that
             // platform's parked one, so a busy chat cannot build a backlog.
@@ -653,4 +764,4 @@ export function initChatBridge(app, io, opts = {}) {
     };
 }
 
-export const _internal = { parseCommand, isDecklistsCommand, plainText, shortLegend, describeMatch, ON_AIR, boardDeck, deckLink };
+export const _internal = { DEFAULTS, parseCommand, isDecklistsCommand, parsePlayerDeckCommand, plainText, shortLegend, describeMatch, ON_AIR, boardDeck, deckLink, deckTarget };
