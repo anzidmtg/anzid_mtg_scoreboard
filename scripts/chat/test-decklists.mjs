@@ -141,18 +141,20 @@ const io = { emit() {}, to: () => ({ emit() {} }), sockets: { emit() {} } };
 let scene = 'Match 1 - Live + Hand Blue';
 const describe = () => on(scene);
 const msg = (text, extra = {}) => ({ platform: 'twitch', userId: String(Math.random()), login: 'viewer1', displayName: 'viewer1', text, ...extra });
-const bridge = initChatBridge(app, io, { connect: false, cooldownMs: 0, dwellMs: 60000, decklistsCooldownMs: 30000,
+const bridge = initChatBridge(app, io, { connect: false, cooldownMs: 0, dwellMs: 60000, decklistsCooldownMs: 30000, listsUrl: '',
     say: async (t) => { sent.push(t); }, describeOnAir: describe });
+const settle = () => new Promise(r => setTimeout(r, 20));   // replies are sent asynchronously, in order
 
 bridge.handle(msg('!decklists'));
 check('replies in chat with an @mention', sent[0] === '@viewer1 Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc)', sent[0]);
 bridge.handle(msg('!decklists', { displayName: 'viewer2' }));
 bridge.handle(msg('!decks', { displayName: 'viewer3' }));
+await settle();
 check('silent inside the 30s window (a raid gets one answer)', sent.length === 1, `${sent.length} messages`);
 
 const s2 = [];
-const fresh = (d = describe) => initChatBridge(app, io, { connect: false, cooldownMs: 0, decklistsCooldownMs: 30000,
-    say: async (t) => { s2.push(t); }, describeOnAir: d });
+const fresh = (d = describe, extra = { listsUrl: '' }) => initChatBridge(app, io, { connect: false, cooldownMs: 0, decklistsCooldownMs: 30000,
+    say: async (t) => { s2.push(t); }, describeOnAir: d, ...extra });
 let b = fresh();
 b.handle(msg('!decklists', { firstMsg: true }));
 check('ignores brand-new accounts', s2.length === 0);
@@ -170,7 +172,13 @@ check('answers again once switched back on', s2.length === 1);
 s2.length = 0;
 b = fresh(() => null);
 b.handle(msg('!decklists'));
-check('can\'t confirm what is on air -> posts nothing', s2.length === 0);
+await settle();
+check('can\'t confirm what is on air, no lists doc -> posts nothing', s2.length === 0);
+s2.length = 0;
+b = fresh(() => null, {});
+b.handle(msg('!decklists'));
+await settle();
+check('can\'t confirm what is on air -> the lists doc alone, never silence', JSON.stringify(s2) === JSON.stringify(['@viewer1 All lists here: https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ']), JSON.stringify(s2));
 
 s2.length = 0;
 let calls = 0;
@@ -225,7 +233,7 @@ initChatBridge({ get(path, h) { if (path.endsWith('/status')) statusHandler = h;
 let status = null;
 statusHandler({}, { json: (o) => { status = o; } });
 check('status page previews what !decklists would say',
-    JSON.stringify(status?.decklists?.messages) === JSON.stringify(['@viewer Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc)']), JSON.stringify(status?.decklists));
+    JSON.stringify(status?.decklists?.messages) === JSON.stringify(['@viewer Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc)', 'All lists here: https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ']), JSON.stringify(status?.decklists));
 check('the preview posts nothing to chat', s8.length === 0);
 statusHandler = null;
 initChatBridge({ get(path, h) { if (path.endsWith('/status')) statusHandler = h; }, post() {} }, io,
@@ -248,7 +256,7 @@ const air = (extra = {}) => ({ ...base, scene: 'Match 1 - Live + Hand Blue', dat
 
 const three = decklistMessages(air(), '@viewer');
 check('reply is three messages: match line, then one per player', Array.isArray(three) && three.length === 3, JSON.stringify(three?.map(m => m.slice(0, 60))));
-check('match line says the decklists follow', three?.[0] === '@viewer Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc) — decklists below', three?.[0]);
+check('match line says it is what is on stream, and that decklists follow', three?.[0] === '@viewer On stream now — Match 1: Anu (Rengar) vs Asc Samdsherman (LeBlanc). Decklists below:', three?.[0]);
 check('Anu\'s line links the exact Piltover-verified list', three?.[1] === `Anu (Rengar): ${BUILDER}${GOLDEN_LEFT}`, three?.[1]?.slice(0, 90));
 check('Asc Samdsherman\'s line links the exact Piltover-verified list', three?.[2] === `Asc Samdsherman (LeBlanc): ${BUILDER}${GOLDEN_RIGHT}`, three?.[2]?.slice(0, 90));
 check('every message fits Twitch\'s 500-char limit', three?.every(m => Array.from(m).length <= 500), JSON.stringify(three?.map(m => m.length)));
@@ -306,10 +314,10 @@ let bb = initChatBridge(sendApp, io, { connect: false, decklistsCooldownMs: 3000
     decklistMessages: (mention) => decklistMessages(air(), mention) });
 bb.handle(msg('!decklists', { displayName: 'fan' }));
 await new Promise(r => setTimeout(r, 50));
-check('all three messages sent, in order', got.length === 3 && got[0].startsWith('@fan Match 1:') && got[1].startsWith('Anu (Rengar):') && got[2].startsWith('Asc Samdsherman'), JSON.stringify(got.map(m => m.slice(0, 30))));
+check('all four messages sent, in order', got.length === 4 && got[0].startsWith('@fan On stream now — Match 1:') && got[1].startsWith('Anu (Rengar):') && got[2].startsWith('Asc Samdsherman') && got[3] === 'All lists here: https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ', JSON.stringify(got.map(m => m.slice(0, 30))));
 let st = null; statusH({}, { json: (o) => { st = o; } });
-check('status page records a clean delivery', st?.decklists?.lastSend?.ok === true && st.decklists.lastSend.sent === 3, JSON.stringify(st?.decklists?.lastSend));
-check('status page previews all three messages', st?.decklists?.messages?.length === 3, JSON.stringify(st?.decklists?.messages?.map(m => m.slice(0, 30))));
+check('status page records a clean delivery', st?.decklists?.lastSend?.ok === true && st.decklists.lastSend.sent === 4, JSON.stringify(st?.decklists?.lastSend));
+check('status page previews all four messages', st?.decklists?.messages?.length === 4, JSON.stringify(st?.decklists?.messages?.map(m => m.slice(0, 30))));
 
 got.length = 0; refuseAt = 1;
 bb = initChatBridge(sendApp, io, { connect: false, decklistsCooldownMs: 30000, say: fake,
@@ -328,6 +336,32 @@ bb = initChatBridge(sendApp, io, { connect: false, decklistsCooldownMs: 30000, s
 bb.handle(msg('!decklists'));
 await new Promise(r => setTimeout(r, 50));
 check('an over-long line never carries a cut link', got[1] === `${'W'.repeat(300)} (Rengar): no link available`, got[1]?.slice(-40));
+
+
+// ── 10. the "all lists" line ────────────────────────────────────────────────
+const LISTS_DOC = 'https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ';
+const listsReply = async (bridgeOpts, text = '!decklists') => {
+    const out = [];
+    const br = initChatBridge(app, io, { connect: false, decklistsCooldownMs: 30000, say: async (t) => { out.push(t); }, ...bridgeOpts });
+    br.handle(msg(text, { displayName: 'fan' }));
+    await settle();
+    return out;
+};
+const lFour = await listsReply({ decklistMessages: (mention) => decklistMessages(air(), mention) });
+check('the 4th message is the lists doc', lFour[3] === `All lists here: ${LISTS_DOC}`, lFour[3]);
+check('the lists link is the short form (no /edit?usp=drivesdk)', !/usp=|\/edit/.test(lFour[3]));
+check('all four messages fit Twitch\'s 500-char limit', lFour.every(m => Array.from(m).length <= 500), JSON.stringify(lFour.map(m => m.length)));
+const lBreak = await listsReply({ decklistMessages: (mention) => decklistMessages(air({ scene: 'Break - Be Right Back' }), mention) });
+check('on a break: no match, then the lists doc', JSON.stringify(lBreak) === JSON.stringify(['@fan no match is on air right now.', `All lists here: ${LISTS_DOC}`]), JSON.stringify(lBreak));
+const l2v2 = await listsReply({ decklistMessages: (mention) => decklistMessages(air({ playerCount: '2v2' }), mention) });
+check('2v2: the match (no deck links), then the lists doc', l2v2.length === 2 && l2v2[0].startsWith('@fan On stream now — Match 1:') && !/piltover/.test(l2v2[0]) && l2v2[1] === `All lists here: ${LISTS_DOC}`, JSON.stringify(l2v2));
+process.env.DECKLISTS_DOC_URL = 'https://example.org/other-doc';
+const lOver = await listsReply({ decklistMessages: (mention) => decklistMessages(air(), mention) });
+check('DECKLISTS_DOC_URL in .env overrides the doc', lOver[3] === 'All lists here: https://example.org/other-doc', lOver[3]);
+process.env.DECKLISTS_DOC_URL = '';
+const lNone = await listsReply({ decklistMessages: (mention) => decklistMessages(air(), mention) });
+check('an empty DECKLISTS_DOC_URL leaves the line out', lNone.length === 3 && !lNone.some(m => m.startsWith('All lists')), JSON.stringify(lNone.map(m => m.slice(0, 20))));
+delete process.env.DECKLISTS_DOC_URL;
 
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

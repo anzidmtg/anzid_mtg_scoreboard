@@ -22,9 +22,10 @@
 // Twitch credentials are configured.
 //
 //   viewer:  !decklists
-//   bot:     @viewer Match 1: justmilkey (Jayce) vs Blank (LeBlanc) — decklists below
+//   bot:     @viewer On stream now — Match 1: justmilkey (Jayce) vs Blank (LeBlanc). Decklists below:
 //   bot:     justmilkey (Jayce): https://piltoverarchive.com/deckbuilder?code=…
 //   bot:     Blank (LeBlanc): https://piltoverarchive.com/deckbuilder?code=…
+//   bot:     All lists here: https://docs.google.com/document/d/…
 //
 // A chat reply only — it never touches anything on air. It answers for the
 // match OBS has on program, reading the same data that match's header is
@@ -60,6 +61,11 @@ const DEFAULTS = {
     // the matchup changes between games, not between chat messages. Requests
     // inside the window are dropped silently: a raid gets one answer, not 200.
     decklistsCooldownMs: 30000,
+    // Every !decklists reply ends with this: the operator's "stream decklists"
+    // Google Doc, public to anyone with the link. It is also what a viewer gets
+    // when the bot can't confirm what is on air, rather than silence. Override
+    // with DECKLISTS_DOC_URL in .env; set it empty to leave the line out.
+    listsUrl: 'https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ',
 };
 
 // What each match's on-air header renders, per the scene collection on the box
@@ -261,7 +267,7 @@ export function readOnAir({
             }
         }
     }
-    return lines.length ? { text: lines.join(' | '), decks } : { text: "the players aren't on the scoreboard yet.", decks: [] };
+    return lines.length ? { text: lines.join(' | '), decks, live: true } : { text: "the players aren't on the scoreboard yet.", decks: [] };
 }
 
 // The match line on its own (the first message of a reply), or null.
@@ -270,17 +276,21 @@ export function describeOnAir(opts) {
     return r ? r.text : null;
 }
 
-// The whole reply, one string per chat message, or null to stay quiet:
-//   @viewer Match 1: Anu (Rengar) vs Blank (LeBlanc) — decklists below
+// The on-air part of the reply, one string per chat message, or null to stay
+// quiet:
+//   @viewer On stream now — Match 1: Anu (Rengar) vs Blank (LeBlanc). Decklists below:
 //   Anu (Rengar): https://piltoverarchive.com/deckbuilder?code=…
 //   Blank (LeBlanc): no link available
 // Separate messages because two deck links don't fit in one (a code link is
-// ~220 characters; Twitch's limit is 500).
+// ~220 characters; Twitch's limit is 500). The bridge adds the "all lists"
+// line after these.
 export function decklistMessages(opts, mention) {
     const r = readOnAir(opts);
     if (!r) return null;
-    if (!r.decks.length) return [`${mention} ${r.text}`];
-    return [`${mention} ${r.text} — decklists below`, ...r.decks.map(p => `${p.who}: ${p.url || 'no link available'}`)];
+    // "Match 1:" alone reads like a label; say it is what is on stream.
+    const head = r.live ? `${mention} On stream now — ${r.text}` : `${mention} ${r.text}`;
+    if (!r.decks.length) return [head];
+    return [`${head}. Decklists below:`, ...r.decks.map(p => `${p.who}: ${p.url || 'no link available'}`)];
 }
 
 export function initChatBridge(app, io, opts = {}) {
@@ -292,7 +302,9 @@ export function initChatBridge(app, io, opts = {}) {
     const channel = (process.env.TWITCH_CHANNEL || '').trim();
     if (!channel) { log('TWITCH_CHANNEL not set — not starting'); return { enabled: false }; }
 
-    const cfg = { ...DEFAULTS, ...opts };
+    // .env is read here, at start-up, like the rest of the bridge's settings.
+    const envLists = process.env.DECKLISTS_DOC_URL;
+    const cfg = { ...DEFAULTS, ...(envLists !== undefined ? { listsUrl: envLists.trim() } : {}), ...opts };
     // Sending is optional: with no Twitch app credentials the bridge still
     // reads chat and shows cards, it just can't post disambiguation prompts
     // (ambiguous names then fall through to the timeout auto-pick).
@@ -316,10 +328,18 @@ export function initChatBridge(app, io, opts = {}) {
     let lastDecklistsSend = null;   // { at, messages, sent, ok, reason } — on the status page
     // Tests inject the whole reply (decklistMessages) or just the match line
     // (describeOnAir); production reads what is on air.
-    const messagesFor = opts.decklistMessages
+    const onAirMessages = opts.decklistMessages
         || (opts.describeOnAir
             ? (mention) => { const t = opts.describeOnAir(); return t ? [`${mention} ${t}`] : null; }
             : (mention) => decklistMessages(undefined, mention));
+    // The on-air messages, then the "all lists" line. When what is on air can't
+    // be confirmed, the lists line alone — it's never wrong, and it beats silence.
+    const messagesFor = (mention) => {
+        const base = onAirMessages(mention);
+        const lists = cfg.listsUrl ? `All lists here: ${cfg.listsUrl}` : null;
+        if (!base || !base.length) return lists ? [`${mention} ${lists}`] : null;
+        return lists ? [...base, lists] : base;
+    };
     const botLogin = String(opts.botLogin ?? process.env.TWITCH_BOT_LOGIN ?? '').trim().toLowerCase();
 
     // One chat message, cut by code point (a UTF-16 slice can split an emoji
@@ -343,7 +363,7 @@ export function initChatBridge(app, io, opts = {}) {
         const messages = messagesFor(`@${msg.displayName}`);
         lastDecklistsAt = Date.now();
         if (!messages || !messages.length) {
-            log("decklists: staying quiet — can't confirm what is on air (OBS link down, or nothing sent to that scoreboard since the server started)");
+            log("decklists: staying quiet — can't confirm what is on air (OBS link down, or nothing sent to that scoreboard since the server started), and no lists doc is set");
             return;
         }
         const out = messages.map(fitMessage);
