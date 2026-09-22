@@ -830,6 +830,17 @@ export function initChatBridge(app, io, opts = {}) {
         youtube: {
             sending: ytSendState,
             reader: youtubeSource?.conn?.state?.() || null,
+            // Exactly what a YouTube viewer's !decklists would get right now,
+            // and its length against the 200 cap — checkable before a show
+            // without posting anything.
+            preview: (() => {
+                try {
+                    const m = opts.youtubeDecklistsMessage
+                        ? opts.youtubeDecklistsMessage('@viewer')
+                        : youtubeDecklistsMessage(undefined, '@viewer', cfg.listsUrl, YT_MAX);
+                    return m ? { message: m, length: Math.max(Array.from(m).length, m.length), limit: YT_MAX } : null;
+                } catch (e) { return { error: e && e.message }; }
+            })(),
             botChannelId: ytBotChannelId,
             cooldownMs: cfg.youtubeDecklistsCooldownMs,
             quota: youtubeQuota(),

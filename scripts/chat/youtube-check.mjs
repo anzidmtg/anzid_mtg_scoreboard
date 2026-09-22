@@ -8,7 +8,13 @@
 //   node scripts/chat/youtube-check.mjs --handle @anzidmtg
 //   node scripts/chat/youtube-check.mjs --channel UC...
 //
-// It never prints the API key, and it posts nothing anywhere.
+//   --server http://192.168.4.43:1378   also read the running server's quota
+//                                       and what a !decklists reply would say
+//   --send-test                         actually post one message to the live
+//                                       chat (needs the OAuth vars; 50 units)
+//
+// It never prints the API key. It posts nothing unless you pass --send-test,
+// which puts one short message in your live chat on purpose.
 import 'dotenv/config';
 
 const API = 'https://www.googleapis.com/youtube/v3';
@@ -44,21 +50,27 @@ async function call(path, params, cost = 1) {
 
 console.log('\nYouTube chat check\n');
 
+const server = arg('server');
 if (!key) {
-    bad('YOUTUBE_API_KEY is not set in .env');
+    bad('YOUTUBE_API_KEY is not set in this .env');
     note('Create one: console.cloud.google.com -> enable "YouTube Data API v3" -> Credentials -> API key.');
     note('Then add YOUTUBE_API_KEY=... to the .env on the machine that runs the server.');
-    process.exit(1);
+    // The key normally lives on the ingest box, not here, so --server is still
+    // worth running: it reads that server's own numbers rather than the API.
+    if (!server) process.exit(1);
+    note('Checking the server below instead — the API checks need a key on THIS machine.');
+} else {
+    ok(`YOUTUBE_API_KEY is set (${key.length} characters — its value is never printed)`);
 }
-ok(`YOUTUBE_API_KEY is set (${key.length} characters — its value is never printed)`);
 
+if (key) {
 const pollMs = Number(process.env.YOUTUBE_POLL_MS) || 5000;
 const perDay = Math.round((10 * 3600 * 1000) / pollMs);
 note(`YOUTUBE_POLL_MS=${pollMs} -> ${perDay} units for a 10-hour day, of 10,000.`);
 if (perDay > 9000) bad(`that is over the bot's own 9,000 budget — YouTube chat would stop early. Use 5000 or more.`);
 
-let channelId = arg('channel') || (process.env.YOUTUBE_CHANNEL_ID || '').trim() || null;
-let videoId = arg('video') || (process.env.YOUTUBE_VIDEO_ID || '').trim() || null;
+var channelId = arg('channel') || (process.env.YOUTUBE_CHANNEL_ID || '').trim() || null;
+var videoId = arg('video') || (process.env.YOUTUBE_VIDEO_ID || '').trim() || null;
 const handle = arg('handle');
 
 try {
@@ -115,6 +127,71 @@ try {
         note('the YouTube Data API v3 (Application restrictions should be None for a server).');
     } else if (e.reason === 'accessNotConfigured') {
         note('YouTube Data API v3 is not enabled on that Cloud project: APIs & Services -> Library -> Enable.');
+    }
+}
+}
+
+// ── the running server: its quota ledger, and what it would say right now ───
+if (server) {
+    const base = server.replace(/\/+$/, '');
+    try {
+        const r = await fetch(`${base}/api/chat-bridge/youtube-usage`, { signal: AbortSignal.timeout(8000) });
+        if (!r.ok) throw new Error(`${r.status}`);
+        console.log('\n' + (await r.text()).replace(/^/gm, '  '));
+    } catch (e) {
+        bad(`could not read ${base}/api/chat-bridge/youtube-usage — ${e.message}`);
+        note(e.message === '404'
+            ? 'That server answers, but has no such route — it is running a build from before the'
+            : 'Is the server running, and is the chat bridge enabled on it (CHAT_BRIDGE_ENABLED=true)?');
+        if (e.message === '404') note('YouTube work. Deploy the current branch and restart it.');
+    }
+    try {
+        const r = await fetch(`${base}/api/chat-bridge/status`, { signal: AbortSignal.timeout(8000) });
+        const j = await r.json();
+        if (!j?.youtube) { note('That server has no YouTube block on its status page — same older build.'); throw new Error('old build'); }
+        const p = j.youtube.preview;
+        if (p?.message) {
+            console.log(`  A YouTube !decklists right now would post (${p.length}/${p.limit} characters):\n`);
+            console.log(`    ${p.message}\n`);
+        } else if (p?.error) bad(`preview failed: ${p.error}`);
+        else note('The bot would stay quiet right now — nothing confirmed on air and no lists doc.');
+    } catch { /* the usage call above already reported the server being unreachable */ }
+}
+
+// ── optional: prove a real message actually posts ───────────────────────────
+if (process.argv.includes('--send-test')) {
+    const cid = process.env.YOUTUBE_CLIENT_ID, csec = process.env.YOUTUBE_CLIENT_SECRET, rt = process.env.YOUTUBE_REFRESH_TOKEN;
+    if (!cid || !csec || !rt) {
+        bad('--send-test needs YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET and YOUTUBE_REFRESH_TOKEN in .env');
+        note('Run: node scripts/chat/youtube-auth.mjs');
+    } else if (!videoId) {
+        bad('--send-test needs a live broadcast — none was found above');
+    } else {
+        const { createYouTubeSender } = await import('../../features/chat/youtube-send.js');
+        let chatId = null;
+        try {
+            const j = await call('videos', { part: 'liveStreamingDetails', id: videoId });
+            chatId = j.items?.[0]?.liveStreamingDetails?.activeLiveChatId || null;
+        } catch (e) { bad(e.message); }
+        if (!chatId) bad('that broadcast has no active live chat to post into');
+        else {
+            const sender = createYouTubeSender({ clientId: cid, clientSecret: csec, refreshToken: rt, liveChatId: () => chatId });
+            const warm = await sender.warmup();
+            if (!warm.ok) { bad(`the bot could not authenticate: ${warm.reason}`); note('If it mentions invalid_grant, the Cloud app is probably still in "Testing" — publish it and re-run youtube-auth.mjs.'); }
+            else {
+                ok(`authenticated as channel ${warm.botChannelId}`);
+                const r = await sender.say('anzidbot check — you can ignore this.');
+                if (r.ok) {
+                    ok('posted a test message (50 units)');
+                    note('Now LOOK at the chat from a SECOND account, switched from "Top chat" to "Live chat".');
+                    note('If you can see it and they cannot, the channel\'s chat filtering is eating the bot —');
+                    note('make sure the bot account is a moderator. The API reports success either way.');
+                } else {
+                    bad(`the message did not post: ${r.reason}`);
+                    if (r.reason === 'not-live') note('The broadcast ended between the check above and the send.');
+                }
+            }
+        }
     }
 }
 
