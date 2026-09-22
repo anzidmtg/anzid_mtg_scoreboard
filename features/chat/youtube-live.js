@@ -116,12 +116,17 @@ export function nextPollMs({ floorMs, gotMessages, quietMs, paused = false, apiH
  *
  * Returns { stop, isConnected, quotaUsed }.
  */
-export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessage, onStatus = () => {} }) {
+export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessage, onStatus: rawStatus = () => {} }) {
     // Operator-tunable via YOUTUBE_POLL_MS. Clamped so a typo cannot set 50ms
     // and torch the day's quota in ten minutes.
     const floorMs = Math.max(MIN_POLL_MS, Number(pollMs) || DEFAULT_POLL_MS);
+    // Kept as well as logged: "the reader has been backing off for 30 minutes"
+    // is exactly what the usage page needs to say, and it only existed in the
+    // server log before.
+    const onStatus = (m) => { lastStatus = m; lastStatusAt = Date.now(); rawStatus(m); };
     let stopped = false, liveChatId = null, pageToken = null;
-    let connected = false, timer = null, primed = false, paused = false;
+    let connected = false, timer = null, primed = false, paused = false, polling = false;
+    let lastStatus = 'starting', lastStatusAt = Date.now(), backingOffUntil = 0;
     let lastMessageAt = Date.now(), misses = 0;
     const seen = new Set();          // liveChatMessageId, guards the first-page backlog
 
@@ -163,11 +168,17 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
 
     async function poll() {
         if (stopped) return;
+        // One poll chain, ever. Resuming from the kill switch used to call
+        // poll() while an iteration was still awaiting the API, and both halves
+        // then scheduled their own next tick — doubling the quota burn for the
+        // rest of the day, invisibly.
+        if (polling) return;
+        polling = true;
         let waitMs = floorMs;
         // Paused by the kill switch: nothing would act on a message anyway, so
         // stop paying for reads. Kept ticking slowly rather than stopped, so
         // resuming does not have to re-resolve the chat.
-        if (paused) { timer = setTimeout(poll, PAUSED_POLL_MS); timer.unref?.(); return; }
+        if (paused) { polling = false; timer = setTimeout(poll, PAUSED_POLL_MS); timer.unref?.(); return; }
         try {
             if (!liveChatId) await resolveChat();
 
@@ -241,6 +252,8 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
             }
             else { onStatus(`error: ${e.message}`); waitMs = 30000; }
         }
+        polling = false;
+        backingOffUntil = waitMs > floorMs * 2 ? Date.now() + waitMs : 0;
         if (!stopped) { timer = setTimeout(poll, waitMs); timer.unref?.(); }
     }
 
@@ -251,12 +264,16 @@ export function connectYouTubeChat({ apiKey, videoId, channelId, pollMs, onMessa
         // The sender needs this, read fresh on every post: the id belongs to
         // one broadcast and forgetChat() drops it when that broadcast ends.
         liveChatId: () => liveChatId,
+        // What the reader is doing right now, for the usage readout.
+        state: () => ({ status: lastStatus, at: new Date(lastStatusAt).toISOString(), paused, backingOffUntil: backingOffUntil || null }),
         // The bridge's kill switch calls this: a paused bot should not spend
         // the day's quota reading chat it will ignore.
         setPaused(p) {
             const was = paused;
             paused = !!p;
-            if (was && !paused) { clearTimeout(timer); lastMessageAt = Date.now(); poll(); }
+            // Only start a chain if none is running; an in-flight poll will
+            // schedule its own next tick now that paused is false.
+            if (was && !paused && !polling) { clearTimeout(timer); lastMessageAt = Date.now(); poll(); }
         },
         quotaUsed: () => quotaSnapshot().units.used,
         // Its own daily bucket, and the one that decides whether channelId mode

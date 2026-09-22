@@ -28,9 +28,15 @@ export const MAX_MESSAGE = 200;
 
 const log = (m) => console.log(`[youtube-send] ${m}`);
 
-// By code point: a YouTube display name can end in an emoji, and a UTF-16 cut
-// would post a lone surrogate.
-export const messageLength = (s) => Array.from(String(s ?? '')).length;
+// YouTube documents the 200 limit in Help and not in the API, so it does not
+// say WHICH length it counts. An emoji is one code point but two UTF-16 units,
+// so the two differ by a factor of two in the worst case. Take the larger: a
+// message that fits under both rules is safe under whichever they use, and the
+// cost of being wrong is a 400 that still charged 50 units.
+export const messageLength = (s) => {
+    const str = String(s ?? '');
+    return Math.max(Array.from(str).length, str.length);
+};
 
 export function createYouTubeSender({
     clientId = process.env.YOUTUBE_CLIENT_ID,

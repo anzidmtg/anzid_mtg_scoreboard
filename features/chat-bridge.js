@@ -352,7 +352,16 @@ export function decklistMessages(opts, mention) {
 // doc that holds every list. The doc link is kept whole (half a URL is worse
 // than none) and the match line gives way first.
 export function youtubeDecklistsMessage(opts, mention, listsUrl, max = 200) {
-    const len = (s) => Array.from(s).length;
+    // The same both-rules length as the sender: YouTube documents 200 without
+    // saying whether it counts code points or UTF-16 units, and an emoji name
+    // is the difference between the two.
+    const len = (s) => Math.max(Array.from(String(s)).length, String(s).length);
+    // Trim by code point (never split an emoji), measured by the larger rule.
+    const cut = (s, limit) => {
+        const a = Array.from(String(s));
+        while (a.length && len(a.join('')) > limit) a.pop();
+        return a.join('');
+    };
     const r = readOnAir(opts);
     const lists = listsUrl ? `All lists here: ${listsUrl}` : '';
     if (!r && !lists) return null;
@@ -363,10 +372,12 @@ export function youtubeDecklistsMessage(opts, mention, listsUrl, max = 200) {
         if (len(whole) <= max) return whole || null;
     }
     // Still too long: keep the lists line intact and cut the match line to fit.
-    if (!lists) return `${Array.from(head).slice(0, max - 1).join('')}…`;
+    if (!lists) return `${cut(head, max - 1)}…`;
     const room = max - len(lists) - 2;
-    if (room < 12) return len(lists) <= max ? lists : null;
-    return `${Array.from(head).slice(0, room - 1).join('')}… ${lists}`;
+    // A doc URL so long that nothing useful fits beside it: say what is on
+    // stream instead. Silence would be the worst of the three.
+    if (room < 12) return len(lists) <= max ? lists : (head ? `${cut(head, max - 1)}…` : null);
+    return `${cut(head, room - 1)}… ${lists}`;
 }
 
 export function initChatBridge(app, io, opts = {}) {
@@ -398,14 +409,26 @@ export function initChatBridge(app, io, opts = {}) {
     // API key, and it can only ever say the short form (see
     // youtubeDecklistsMessage). Tests inject youtubeSay.
     let youtubeSource = null;     // set when the reader connects, for the live chat id
+    // A YouTube display name is free text, and the bot's own reply is read back
+    // by its own reader. A viewer called "[[Loose Cannon]]" would otherwise put
+    // a card of their choosing on air through the bot's mouth. plainText()
+    // already strips brackets and format characters and caps the length — the
+    // same treatment scoreboard names get.
+    const mentionFor = (msg) => `@${plainText(msg.displayName) || 'viewer'}`;
     const ytSender = opts.youtubeSay ? null
         : createYouTubeSender({ liveChatId: () => youtubeSource?.conn?.liveChatId?.() || null });
     const ytSay = opts.youtubeSay || (ytSender ? ytSender.say : null);
     const canSendYouTube = !!opts.youtubeSay || !!(ytSender && ytSender.configured);
     let ytBotChannelId = null;
+    // Three states, not two: "configured" only means .env has values. A refresh
+    // token that expired (the 7-day "Testing" trap) is configured and dead, and
+    // a readout that says ON in that state hides the very failure it exists to
+    // catch. Only warmup can tell them apart.
+    let ytSendState = opts.youtubeSay ? 'on' : (ytSender && ytSender.configured ? 'checking' : 'off');
     if (ytSender && ytSender.configured) {
         ytSender.warmup().then(r => {
             ytBotChannelId = r.botChannelId || null;
+            ytSendState = r.ok ? 'on' : `unavailable: ${r.reason}`;
             log(r.ok ? `youtube sending ready (posting as ${r.botChannelId || 'unknown channel'})` : `youtube sending unavailable: ${r.reason}`);
         });
     }
@@ -421,12 +444,13 @@ export function initChatBridge(app, io, opts = {}) {
     // a YouTube message arrives on a poll, so the menu would time out before
     // the answer could reach us. canAnswerOn: can we say anything at all there?
     const canPromptOn = (platform) => platform === 'twitch' && canSend;
-    const canAnswerOn = (platform) => platform === 'youtube' ? canSendYouTube : canPromptOn(platform);
+    const canAnswerOn = (platform) => platform === 'youtube' ? (canSendYouTube && ytSendState === 'on') : canPromptOn(platform);
     const sayOn = (platform, text) => (platform === 'youtube' ? ytSay(text) : say(text));
     if (sender) {
         if (sender.configured) sender.warmup().then(r => log(r.ok ? 'chat sending ready' : `chat sending unavailable: ${r.reason}`));
         else log('chat sending not configured — prompts disabled, timeout auto-pick still works');
     }
+    const bootedAt = Date.now();
     let lastShownAt = 0, shownThisStream = 0, live = true;
     let lastCooldownNoticeAt = 0;
     const lastDecklistsAt = { twitch: 0, youtube: 0 };
@@ -465,7 +489,7 @@ export function initChatBridge(app, io, opts = {}) {
     // so the admin knows whether it landed — unless the kill switch was hit
     // meanwhile: then nothing is written and nothing is said.
     function loadPlayerDeck(msg, cmd) {
-        const who = `@${msg.displayName}`;
+        const who = mentionFor(msg);
         const tell = (text) => (live ? say(`${who} ${text}`).catch(() => {}) : Promise.resolve());
         const cmdName = `!p${cmd.player}`;
         if (getGameSelection() !== 'riftbound') { tell(`${cmdName} only works for Riftbound.`); return; }
@@ -506,23 +530,25 @@ export function initChatBridge(app, io, opts = {}) {
         if (!canAnswerOn(msg.platform) || msg.firstMsg) return;
         const yt = msg.platform === 'youtube';
         const window_ = yt ? cfg.youtubeDecklistsCooldownMs : cfg.decklistsCooldownMs;
+        const windowWas = lastDecklistsAt[msg.platform] || 0;
         if (!isAdmin(msg) && Date.now() - (lastDecklistsAt[msg.platform] || 0) < window_) return;
         // Read BEFORE spending the window, so a read that throws leaves the
         // next viewer free to ask. "Can't tell" still spends it: during a raid
         // that is one quiet check per window, not one per message.
         // YouTube gets the single short message; Twitch gets the full set.
+        const mention = mentionFor(msg);
         const messages = yt
             ? [opts.youtubeDecklistsMessage
-                ? opts.youtubeDecklistsMessage(`@${msg.displayName}`)
-                : youtubeDecklistsMessage(undefined, `@${msg.displayName}`, cfg.listsUrl, YT_MAX)].filter(Boolean)
-            : messagesFor(`@${msg.displayName}`);
+                ? opts.youtubeDecklistsMessage(mention)
+                : youtubeDecklistsMessage(undefined, mention, cfg.listsUrl, YT_MAX)].filter(Boolean)
+            : messagesFor(mention);
         lastDecklistsAt[msg.platform] = Date.now();
         if (!messages || !messages.length) {
             log("decklists: staying quiet — can't confirm what is on air (OBS link down, or nothing sent to that scoreboard since the server started), and no lists doc is set");
             return;
         }
         const out = yt ? messages : messages.map(fitMessage);
-        log(`decklists for ${msg.displayName}: ${out.length} message(s) — ${out[0]}`);
+        log(`decklists for ${plainText(msg.displayName)} on ${msg.platform}: ${out.length} message(s) — ${out[0]}`);
         // In order and one at a time (the sender spaces them ~1s apart),
         // stopping at the first one Twitch refuses so a player's line never
         // arrives without the match line above it. The outcome goes on the
@@ -535,6 +561,9 @@ export function initChatBridge(app, io, opts = {}) {
                 sent++;
             }
             lastDecklistsSend = { at: new Date().toISOString(), platform: msg.platform, messages: out.length, sent, ok: sent === out.length, reason };
+            // Nothing got through: give the window back, so one timeout doesn't
+            // leave the next viewer waiting out a reply that never happened.
+            if (sent === 0) lastDecklistsAt[msg.platform] = windowWas;
             if (reason) log(`decklists: ${msg.platform} did not deliver message ${sent + 1} of ${out.length} (${reason})`);
         })().catch((e) => {
             lastDecklistsSend = { at: new Date().toISOString(), messages: out.length, sent: 0, ok: false, reason: (e && e.message) || 'error' };
@@ -799,7 +828,8 @@ export function initChatBridge(app, io, opts = {}) {
         // Reading and replying spend ONE YouTube allowance; this is that
         // ledger, plus what is left expressed as messages rather than units.
         youtube: {
-            sending: canSendYouTube ? 'on' : 'off',
+            sending: ytSendState,
+            reader: youtubeSource?.conn?.state?.() || null,
             botChannelId: ytBotChannelId,
             cooldownMs: cfg.youtubeDecklistsCooldownMs,
             quota: youtubeQuota(),
@@ -823,6 +853,10 @@ export function initChatBridge(app, io, opts = {}) {
     app.get('/api/chat-bridge/youtube-usage', (_req, res) => {
         const q = youtubeQuota();
         const pct = (n) => `${Math.round((n / q.units.budget) * 100)}%`;
+        const reader = youtubeSource?.conn?.state?.();
+        const backingOff = reader?.backingOffUntil && reader.backingOffUntil > Date.now()
+            ? `  reader:   ${reader.status} (retrying ${new Date(reader.backingOffUntil).toLocaleTimeString()})`
+            : reader ? `  reader:   ${reader.paused ? 'paused' : reader.status}` : '';
         res.type('text/plain').send([
             `YouTube quota — ${q.day}`,
             ``,
@@ -830,12 +864,17 @@ export function initChatBridge(app, io, opts = {}) {
             `    reading ${q.reading.units}`,
             `    replies ${q.sending.units}  (${q.sending.messages} message${q.sending.messages === 1 ? '' : 's'}, cap ${q.sending.budget} units)`,
             `  searches  ${q.searches.used} of ${q.searches.cap}   ${q.searches.left === 0 ? '<- spent: pin YOUTUBE_VIDEO_ID' : ''}`,
+            ...(backingOff ? [``, backingOff] : []),
             ``,
             `  left today: about ${q.left.messages} more repl${q.left.messages === 1 ? 'y' : 'ies'},`,
             `              or ${q.units.left} units of reading (~${Math.round(q.units.left / 720)}h at 5s).`,
             ``,
-            `  sending is ${canSendYouTube ? 'ON' : 'OFF'}; replies are capped at ${YT_MAX} characters and`,
-            `  one per ${Math.round(cfg.youtubeDecklistsCooldownMs / 60000)} minutes. Google's own view: Cloud Console -> APIs & Services -> Quotas.`,
+            `  sending: ${ytSendState.toUpperCase()}${ytBotChannelId ? ` (as ${ytBotChannelId})` : ''}. Replies are capped at ${YT_MAX} characters`,
+            `  and one per ${Math.round(cfg.youtubeDecklistsCooldownMs / 60000)} minutes.`,
+            ``,
+            `  Counted since this server started (${new Date(bootedAt).toLocaleString()}), NOT since`,
+            `  midnight Pacific — a restart today means Google's number is higher than this one.`,
+            `  Google's own view: Cloud Console -> APIs & Services -> Quotas.`,
             ``,
         ].join('\n'));
     });

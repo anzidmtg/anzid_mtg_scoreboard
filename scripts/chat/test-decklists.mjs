@@ -865,5 +865,93 @@ check('the real data/controlData.json was never touched', realHash() === REAL_BE
     check('youtube: the window is 15 minutes, not Twitch\'s 1', _internal.DEFAULTS.youtubeDecklistsCooldownMs === 900000);
 }
 
+// ── 15. what the review of the YouTube sender found ─────────────────────────
+{
+    const { youtubeDecklistsMessage } = await import('../../features/chat-bridge.js');
+    const { createYouTubeSender, messageLength } = await import('../../features/chat/youtube-send.js');
+    const { connectYouTubeChat } = await import('../../features/chat/youtube-live.js');
+    const q = await import('../../features/chat/youtube-quota.js');
+    const DOC = 'https://docs.google.com/document/d/1417NC3vjNUJbROWBqp0tPlFJY7asy-fdsFAMjlBMmzQ';
+    const ytAir = (extra = {}) => ({ ...base, scene: 'Match 1 - Live + Hand Blue', data: { 1: { match1: ONAIR } }, ...extra });
+
+    // REVIEW: an emoji is 1 code point but 2 UTF-16 units — YouTube doesn't say which it counts
+    check('REVIEW: the length guard takes the larger of the two counting rules',
+        messageLength('👩‍💻👩‍💻') === 'x'.repeat('👩‍💻👩‍💻'.length).length && messageLength('abc') === 3, String(messageLength('👩‍💻👩‍💻')));
+    const emojiName = '@' + '🎮'.repeat(30);
+    const withEmoji = youtubeDecklistsMessage(ytAir(), emojiName, DOC);
+    check('REVIEW: a message is under 200 by BOTH counts, emoji mention included',
+        messageLength(withEmoji) <= 200, `${messageLength(withEmoji)} (utf16 ${withEmoji.length}, points ${Array.from(withEmoji).length})`);
+
+    // REVIEW: a viewer's display name reaches a message the bot then reads back
+    {
+        const said = [], shownNow = [];
+        const ioC = { emit: (ev, d) => { if (ev === 'chat-card-shown') shownNow.push(d.name); }, to: () => ({ emit() {} }), sockets: { emit() {} } };
+        const br = initChatBridge(app, ioC, { connect: false, say: async () => {}, describeOnAir: describe,
+            youtubeSay: async (t) => { said.push(t); return { ok: true }; } });
+        br.handle({ platform: 'youtube', userId: 'yt-evil', login: 'yt-evil', displayName: '[[Loose Cannon]]', text: '!decklists' });
+        await settle();
+        check('REVIEW: a viewer named "[[card]]" cannot put a card on air through the bot\'s own reply',
+            said.length === 1 && !said[0].includes('[[') && shownNow.length === 0, JSON.stringify([said[0], shownNow]));
+    }
+
+    // REVIEW: a failed send must not spend the next viewer's 15-minute window
+    {
+        const attempts = [];
+        let failNext = true;
+        const br = initChatBridge(app, io, { connect: false, say: async () => {}, describeOnAir: describe,
+            youtubeSay: async (t) => { attempts.push(t); if (failNext) { failNext = false; return { ok: false, reason: '503' }; } return { ok: true }; },
+            youtubeDecklistsMessage: (m) => `${m} On stream now — Match 1.` });
+        const ask = (id) => br.handle({ platform: 'youtube', userId: id, login: id, displayName: id, text: '!decklists' });
+        ask('a'); await settle();
+        ask('b'); await settle();
+        check('REVIEW: after a failed reply the next viewer is still answered', attempts.length === 2 && attempts[1].startsWith('@b'), JSON.stringify(attempts));
+        ask('c'); await settle();
+        check('REVIEW: …but a delivered reply still holds the window', attempts.length === 2, JSON.stringify(attempts));
+    }
+
+    // REVIEW: "sending is ON" must not survive a dead refresh token
+    {
+        const failWarmup = async (url) => String(url).includes('oauth2')
+            ? { ok: false, status: 400, text: async () => '{"error":"invalid_grant"}' }
+            : { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
+        const sender = createYouTubeSender({ clientId: 'c', clientSecret: 's', refreshToken: 'expired', liveChatId: () => 'CHAT', fetchImpl: failWarmup });
+        const warm = await sender.warmup();
+        check('REVIEW: warmup reports an expired refresh token rather than claiming ready',
+            warm.ok === false && /7 days|invalid_grant/.test(warm.reason), JSON.stringify(warm));
+        const posted = await sender.say('hello');
+        check('REVIEW: …and a send with that token fails without pretending otherwise', posted.ok === false);
+    }
+
+    // REVIEW: the kill switch must not fork the poll chain and double the burn
+    {
+        q._reset();
+        let calls = 0;
+        const realFetch = globalThis.fetch;
+        globalThis.fetch = async (url) => {
+            calls++;
+            if (String(url).includes('/videos')) return { ok: true, json: async () => ({ items: [{ liveStreamingDetails: { activeLiveChatId: 'C' } }] }) };
+            return { ok: true, json: async () => ({ items: [], nextPageToken: 'p', pollingIntervalMillis: 0 }) };
+        };
+        const conn = connectYouTubeChat({ apiKey: 'k', videoId: 'v', pollMs: 1000, onMessage: () => {}, onStatus: () => {} });
+        await new Promise(r => setTimeout(r, 60));
+        const afterFirst = calls;
+        conn.setPaused(true); conn.setPaused(false);   // flipped while a poll may be in flight
+        conn.setPaused(true); conn.setPaused(false);
+        await new Promise(r => setTimeout(r, 60));
+        conn.stop();
+        globalThis.fetch = realFetch;
+        check('REVIEW: flipping the kill switch does not start a second poll chain',
+            calls - afterFirst <= 2, `${calls - afterFirst} extra calls after 4 flips`);
+        check('REVIEW: the reader reports its own state for the usage page', typeof conn.state === 'function' && !!conn.state().status, JSON.stringify(conn.state?.()));
+        q._reset();
+    }
+
+    // REVIEW: an over-long doc URL must not silently turn the answer off
+    const hugeDoc = 'https://docs.google.com/document/d/' + 'x'.repeat(180);
+    const fallback = youtubeDecklistsMessage(ytAir(), '@v', hugeDoc);
+    check('REVIEW: a doc link too long to fit leaves the match line, not silence',
+        !!fallback && messageLength(fallback) <= 200 && /Match 1/.test(fallback), `${fallback}`);
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
