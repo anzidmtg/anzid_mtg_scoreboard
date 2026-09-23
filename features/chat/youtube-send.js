@@ -139,7 +139,16 @@ export function createYouTubeSender({
             spend(1, 'resolve');
             const j = await r.json();
             botChannelId = j.items?.[0]?.id || null;
-            log(`ready — posting as channel ${botChannelId || '(unknown)'}`);
+            if (!botChannelId) {
+                // A Google account is not a YouTube channel. Consent granted to
+                // the bare account (rather than to its channel, which for a
+                // Brand Account is a separate entry in the chooser) leaves a
+                // token that can refresh but has no identity to post as — every
+                // send would fail. Say so now, not at the first reply.
+                log('FAILED — that token has no YouTube channel behind it. Re-run scripts/chat/youtube-auth.mjs and pick the BOT CHANNEL at the account chooser, not the plain Google account.');
+                return { ok: false, reason: 'no channel on the authorized account — authorize the bot CHANNEL, not the account' };
+            }
+            log(`ready — posting as channel ${botChannelId}`);
             return { ok: true, botChannelId };
         } catch (e) {
             log(`warmup failed: ${e.message}`);

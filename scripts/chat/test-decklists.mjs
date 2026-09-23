@@ -922,6 +922,18 @@ check('the real data/controlData.json was never touched', realHash() === REAL_BE
         check('REVIEW: …and a send with that token fails without pretending otherwise', posted.ok === false);
     }
 
+    // A token that refreshes fine but belongs to an account with no channel:
+    // every send would fail, so warmup must call it a failure, not "ready".
+    {
+        const noChannel = async (url) => String(url).includes('oauth2')
+            ? { ok: true, status: 200, text: async () => JSON.stringify({ access_token: 't', expires_in: 3600 }) }
+            : { ok: true, status: 200, json: async () => ({ items: [], pageInfo: { totalResults: 0 } }), text: async () => '{}' };
+        const sender = createYouTubeSender({ clientId: 'c', clientSecret: 's', refreshToken: 'r', liveChatId: () => 'CHAT', fetchImpl: noChannel });
+        const warm = await sender.warmup();
+        check('a token with no YouTube channel behind it is a FAILURE, not "ready"',
+            warm.ok === false && /channel/i.test(warm.reason), JSON.stringify(warm));
+    }
+
     // REVIEW: the kill switch must not fork the poll chain and double the burn
     {
         q._reset();
