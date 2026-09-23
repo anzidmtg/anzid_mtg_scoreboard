@@ -70,6 +70,19 @@ const server = createServer(async (req, res) => {
             if (!j.refresh_token && r.ok) console.error('      No refresh token came back. That happens when this account has already\n      authorized the app: revoke it at myaccount.google.com -> Data & privacy ->\n      Third-party access, then run this again.');
             return done(server, 1);
         }
+        // A token minted while the app is still in "Testing" is on a 7-day
+        // clock, and Google says so right here in the response. Catching it now
+        // beats finding out when chat goes silent between shows.
+        if (j.refresh_token_expires_in) {
+            const days = Math.round(j.refresh_token_expires_in / 86400);
+            console.log(`\n  WARNING  this refresh token EXPIRES in ~${days} day${days === 1 ? '' : 's'}.`);
+            console.log('           That means the Cloud app is still in "Testing". Publish it');
+            console.log('           (console.cloud.google.com/auth/audience -> Publish app), revoke this');
+            console.log('           grant at myaccount.google.com/permissions, and run this again — a');
+            console.log('           token minted before publishing keeps its clock.\n');
+        } else {
+            console.log('\n  ok    the token has no expiry attached — the app is published, as it should be.');
+        }
         console.log('\n  ok    authorized. Add this line to the .env of the machine that runs the server:\n');
         console.log(`YOUTUBE_REFRESH_TOKEN=${j.refresh_token}\n`);
         console.log('  Keep it out of git (.env is already ignored) and out of chat messages.');

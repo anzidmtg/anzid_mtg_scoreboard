@@ -71,6 +71,13 @@ export function createYouTubeSender({
             throw new Error(`token refresh failed: ${r.status} ${why}`);
         }
         const j = JSON.parse(text);
+        // Google returns this only while the app is in "Testing", where refresh
+        // tokens die after 7 days. Say so every time rather than letting chat
+        // go quiet between shows for no visible reason.
+        if (j.refresh_token_expires_in) {
+            const days = Math.round(j.refresh_token_expires_in / 86400);
+            log(`WARNING: this refresh token expires in ~${days} day(s) — the Cloud app is still in "Testing". Publish it, then re-run scripts/chat/youtube-auth.mjs.`);
+        }
         token = j.access_token;
         tokenExpiresAt = Date.now() + (j.expires_in || 3600) * 1000;
         return token;

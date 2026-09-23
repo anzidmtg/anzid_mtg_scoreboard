@@ -159,9 +159,25 @@ sent there: the answer arrives on a poll, long after the 5-second window.
    place): Credentials → Create credentials → OAuth client ID → **Desktop app**.
 3. OAuth consent screen: add scope `.../auth/youtube.force-ssl`, then **Publish
    app** so the status is "In production". Left in "Testing", Google expires the
-   refresh token after **7 days** and chat dies between shows. Verification is
-   not required — you are the only user, which Google's docs name as the
-   exception; you will see one "unverified app" screen during step 4.
+   refresh token after **7 days** and chat dies between shows.
+
+   The console will say the sensitive scope needs verification. It does not
+   block publishing — Google's own submission guide has it the other way round:
+   apps in testing "are not applicable for verification". Do NOT submit; a
+   one-channel bot is a Personal Use app, and verification buys only cosmetics
+   (no "unverified" screen, and a lifted 100-user cap that is irrelevant at
+   n=1). The 7-day clock is tied to publishing status, not verification status.
+
+   **Publish BEFORE minting the token.** A refresh token issued while the app
+   was still in Testing keeps its 7-day clock even after you publish — which is
+   what is behind most "it still expired in production" reports. If you already
+   have one: revoke the grant at myaccount.google.com/permissions, then run
+   youtube-auth.mjs again. It now prints a warning when the token comes back
+   with an expiry attached, and so does the server on every token refresh.
+
+   One permanent cost to know: a published unverified app has a lifetime cap of
+   100 users that can never be reset. Irrelevant for one bot account — but do
+   not burn accounts on testing.
 4. `node scripts/chat/youtube-auth.mjs` — sign in as the posting account, and it
    prints the refresh token to paste into `.env`. Nothing is written to disk.
 5. Add to `.env`:
