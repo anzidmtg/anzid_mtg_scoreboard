@@ -417,7 +417,12 @@ export function initChatBridge(app, io, opts = {}) {
     // a card of their choosing on air through the bot's mouth. plainText()
     // already strips brackets and format characters and caps the length — the
     // same treatment scoreboard names get.
-    const mentionFor = (msg) => `@${plainText(msg.displayName) || 'viewer'}`;
+    // YouTube display names ARE handles and already carry the @ ("@anzidmtg"),
+    // while Twitch's never do. Prepending blindly produced "@@anzidmtg" on air.
+    const mentionFor = (msg) => {
+        const name = plainText(msg.displayName) || 'viewer';
+        return name.startsWith('@') ? name : `@${name}`;
+    };
     const ytSender = opts.youtubeSay ? null
         : createYouTubeSender({ liveChatId: () => youtubeSource?.conn?.liveChatId?.() || null });
     const ytSay = opts.youtubeSay || (ytSender ? ytSender.say : null);

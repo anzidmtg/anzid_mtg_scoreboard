@@ -894,6 +894,24 @@ check('the real data/controlData.json was never touched', realHash() === REAL_BE
             said.length === 1 && !said[0].includes('[[') && shownNow.length === 0, JSON.stringify([said[0], shownNow]));
     }
 
+    // Seen on air: YouTube display names already start with @, Twitch's do not
+    {
+        const said = [];
+        const br = initChatBridge(app, io, { connect: false, say: async () => {}, describeOnAir: describe,
+            youtubeSay: async (t) => { said.push(t); return { ok: true }; },
+            youtubeDecklistsMessage: (m) => `${m} All lists here: doc` });
+        br.handle({ platform: 'youtube', userId: 'y1', login: 'y1', displayName: '@anzidmtg', text: '!decklists' });
+        await settle();
+        check('a YouTube handle is not double-@ed', said[0] === '@anzidmtg All lists here: doc', said[0]);
+    }
+    {
+        const said = [];
+        const br = initChatBridge(app, io, { connect: false, listsUrl: '', say: async (t) => { said.push(t); }, describeOnAir: describe });
+        br.handle({ platform: 'twitch', userId: 't1', login: 'viewer', displayName: 'viewer', text: '!decklists' });
+        await settle();
+        check('…and a Twitch name still gets its @', (said[0] || '').startsWith('@viewer '), said[0]);
+    }
+
     // REVIEW: a failed send must not spend the next viewer's 15-minute window
     {
         const attempts = [];
