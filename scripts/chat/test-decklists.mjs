@@ -983,5 +983,92 @@ check('the real data/controlData.json was never touched', realHash() === REAL_BE
         !!fallback && messageLength(fallback) <= 200 && /Match 1/.test(fallback), `${fallback}`);
 }
 
+// ── 16. command reminders ────────────────────────────────────────────────────
+{
+    const q = await import('../../features/chat/youtube-quota.js');
+    const { reminderText, DEFAULTS: D } = _internal;
+    const REMINDER = { twitch: reminderText('twitch', 'riftbound'), youtube: reminderText('youtube', 'riftbound') };
+    const MIN = 60000, LATER = Date.now() + 31 * MIN;
+    const make = (extra = {}) => {
+        const said = { twitch: [], youtube: [] };
+        const br = initChatBridge(app, io, { connect: false, describeOnAir: describe, botLogin: 'anzidbot',
+            say: async (t) => { said.twitch.push(t); return { ok: true }; },
+            youtubeSay: async (t) => { said.youtube.push(t); return { ok: true }; }, ...extra });
+        const chat = (platform, n, login = 'viewer') => { for (let i = 0; i < n; i++) br.handle({ platform, userId: `${platform}-${login}-${i}`, login, displayName: login, text: 'gg' }); };
+        return { br, said, chat };
+    };
+
+    check('reminders: every 30 minutes by default', D.reminderEveryMs === 30 * MIN && D.reminderMinLines === 3);
+    check('reminders: the text names both viewer commands, and not the admin ones',
+        ['twitch', 'youtube'].every(p => /!card/.test(REMINDER[p]) && /\[\[Kennen\]\]/.test(REMINDER[p]) && /!decklists/.test(REMINDER[p]) && !/!p1|!p2/.test(REMINDER[p])));
+    for (const game of ['riftbound', 'mtg', 'starwars']) for (const p of ['twitch', 'youtube']) {
+        const txt = reminderText(p, game);
+        const lim = p === 'youtube' ? 200 : 450;
+        check(`reminders: ${game} on ${p} fits (${Math.max(Array.from(txt).length, txt.length)}/${lim})`, Math.max(Array.from(txt).length, txt.length) <= lim, txt);
+    }
+    check('reminders: the example is a real card for the game, never a placeholder a viewer would paste',
+        !/<|\[\[name\]\]/i.test(reminderText('twitch', 'riftbound')) && /Lightning Bolt/.test(reminderText('twitch', 'mtg')));
+    {
+        // What a viewer gets for copying the example exactly
+        const { resolveCardName } = await import('../../features/chat/resolve.js');
+        const hit = resolveCardName('riftbound', 'Kennen');
+        check('reminders: copying the Riftbound example shows Kennen, as promised', /^Kennen/.test(hit?.name || ''), hit?.name);
+    }
+
+    let t = make();
+    t.chat('twitch', 5); t.chat('youtube', 5);
+    check('reminders: nothing before the interval is up, however busy chat is', t.br._test.checkReminders(Date.now() + 10 * MIN).length === 0);
+    await settle();
+    check('reminders: …and nothing was posted', t.said.twitch.length === 0 && t.said.youtube.length === 0);
+
+    t = make();
+    t.chat('twitch', 2);
+    check('reminders: a quiet chat is left alone even when the interval is up', t.br._test.checkReminders(LATER).length === 0);
+    t.chat('twitch', 1);
+    const fired = t.br._test.checkReminders(LATER);
+    await settle();
+    check('reminders: fires once enough viewers have spoken', JSON.stringify(fired) === '["twitch"]' && t.said.twitch[0] === REMINDER.twitch, JSON.stringify([fired, t.said]));
+    check('reminders: platforms keep their own clocks — Twitch chatter does not remind YouTube', t.said.youtube.length === 0);
+    check('reminders: the count starts over after one is posted', t.br._test.checkReminders(LATER + 31 * MIN).length === 0);
+
+    t = make();
+    t.chat('youtube', 3);
+    t.br._test.checkReminders(LATER);
+    await settle();
+    check('reminders: YouTube gets its own, shorter text', t.said.youtube[0] === REMINDER.youtube, t.said.youtube[0]);
+
+    t = make();
+    t.chat('twitch', 5, 'anzidbot');
+    check('reminders: the bot\'s own messages do not count as chat', t.br._test.checkReminders(LATER).length === 0);
+
+    t = make();
+    t.chat('twitch', 5);
+    liveHandler({ params: { state: 'off' } }, { json() {} });
+    check('reminders: the kill switch silences them too', t.br._test.checkReminders(LATER).length === 0);
+    liveHandler({ params: { state: 'on' } }, { json() {} });
+
+    q._reset();
+    q.spend(q.DAILY_BUDGET - 500, 'read');      // 500 units left = 10 replies' worth
+    t = make();
+    t.chat('youtube', 5); t.chat('twitch', 5);
+    const withReserve = t.br._test.checkReminders(LATER);
+    await settle();
+    check('reminders: on YouTube they never spend the last 10 replies of the day',
+        !withReserve.includes('youtube') && t.said.youtube.length === 0, JSON.stringify(withReserve));
+    check('reminders: …while Twitch, which costs nothing, still gets its reminder', withReserve.includes('twitch'));
+    q._reset();
+
+    const envWas = process.env.CHAT_REMINDER_MINUTES;
+    process.env.CHAT_REMINDER_MINUTES = '0';
+    t = make(); t.chat('twitch', 5);
+    check('reminders: CHAT_REMINDER_MINUTES=0 turns them off', t.br._test.checkReminders(LATER + 600 * MIN).length === 0);
+    process.env.CHAT_REMINDER_MINUTES = '1';
+    t = make(); t.chat('twitch', 5);
+    check('reminders: a typo like 1 minute is floored at 5, not every minute',
+        t.br._test.checkReminders(Date.now() + 2 * MIN).length === 0 && t.br._test.checkReminders(Date.now() + 6 * MIN).length === 1);
+    if (envWas === undefined) delete process.env.CHAT_REMINDER_MINUTES; else process.env.CHAT_REMINDER_MINUTES = envWas;
+    await settle();
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

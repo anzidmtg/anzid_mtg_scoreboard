@@ -85,7 +85,39 @@ const DEFAULTS = {
     // costs 50 quota units from the same allowance reading spends: at 15
     // minutes that is at most 200 units an hour, which a show never notices.
     youtubeDecklistsCooldownMs: 900000,
+    // Every so often, tell chat what it can type — but only once people have
+    // been chatting since the last reminder. A timer that fires into an empty
+    // chat is noise before the show starts, and on YouTube it is 50 quota units
+    // for nobody. CHAT_REMINDER_MINUTES (0 = off) and CHAT_REMINDER_MIN_LINES
+    // override these in .env.
+    reminderEveryMs: 30 * 60 * 1000,
+    reminderMinLines: 3,
 };
+
+// What the reminder says. Viewer commands only — !p1/!p2 are for admins.
+//
+// The example is a REAL card for the game on stream, never a placeholder:
+// viewers copy examples literally, and "[[name]]" or "!card <name>" both
+// resolve — to "Nami, Headstrong" in Riftbound, "Say Its Name" in MTG — so a
+// placeholder would put a random card on air for everyone who pasted it. A real
+// example does exactly what it says. Kennen also shows off the "did you mean"
+// menu on Twitch, since there are three of him.
+//
+// YouTube's must fit its 200-character cap, and describes what !decklists
+// gives there (the lists doc; deck links don't fit). Twitch's can say "links".
+const REMINDER_EXAMPLE = { riftbound: 'Kennen', mtg: 'Lightning Bolt' };
+export function reminderText(platform, game) {
+    const ex = REMINDER_EXAMPLE[game];
+    const card = ex
+        ? `!card and a card name puts it on stream (e.g. !card ${ex} or [[${ex}]])`
+        : '!card and a card name puts it on stream';
+    const lists = platform === 'youtube' ? 'shows who is playing and where the lists are' : 'shows who is playing and links their lists';
+    return `Chat commands: ${card} · !decklists ${lists}`;
+}
+// Never let a reminder spend one of the last few YouTube replies of the day:
+// those belong to viewers who actually asked for something.
+const REMINDER_YT_RESERVE = 10;
+const REMINDER_MIN_INTERVAL_MS = 5 * 60 * 1000;   // a typo can't make it spam
 
 // What each match's on-air header renders, per the scene collection on the box
 // (checked 2026-09-20). This table is the whole contract — if the OBS wiring
@@ -395,10 +427,14 @@ export function initChatBridge(app, io, opts = {}) {
     // .env is read here, at start-up, like the rest of the bridge's settings.
     const envLists = process.env.DECKLISTS_DOC_URL;
     const envAdmins = process.env.CHAT_ADMINS;
+    const envRemMin = (process.env.CHAT_REMINDER_MINUTES ?? '').trim();
+    const envRemLines = (process.env.CHAT_REMINDER_MIN_LINES ?? '').trim();
     const cfg = {
         ...DEFAULTS,
         ...(envLists !== undefined ? { listsUrl: envLists.trim() } : {}),
         ...(envAdmins !== undefined ? { admins: envAdmins.split(',') } : {}),
+        ...(envRemMin !== '' ? { reminderEveryMs: Number(envRemMin) * 60000 } : {}),
+        ...(envRemLines !== '' ? { reminderMinLines: Number(envRemLines) } : {}),
         ...opts,
     };
     const admins = new Set((cfg.admins || []).map(a => String(a).trim().toLowerCase()).filter(Boolean));
@@ -715,6 +751,8 @@ export function initChatBridge(app, io, opts = {}) {
         // Same on YouTube, where identity is a channel id, not a login. The
         // bridge learns the bot's own id from the sender's warmup call.
         if (msg.platform === 'youtube' && ytBotChannelId && String(msg.userId) === ytBotChannelId) return;
+        // A viewer said something: that is what lets the next reminder fire.
+        reminderLines[msg.platform] = (reminderLines[msg.platform] || 0) + 1;
         // A bare number resolves this user's own open prompt, and is never
         // treated as a card name.
         // Key by platform+id: a Twitch id and a YouTube id could otherwise
@@ -833,6 +871,10 @@ export function initChatBridge(app, io, opts = {}) {
         })),
         connected: sources.some(s => s.conn.isConnected()),
         shownThisStream, cooldownMs: cfg.cooldownMs, admins: [...admins],
+        reminders: {
+            everyMinutes: reminderEvery / 60000, minLines: reminderMin,
+            linesSince: { ...reminderLines }, last: lastReminder,
+        },
         // Reading and replying spend ONE YouTube allowance; this is that
         // ledger, plus what is left expressed as messages rather than units.
         youtube: {
@@ -898,6 +940,45 @@ export function initChatBridge(app, io, opts = {}) {
         ].join('\n'));
     });
 
+    // ── Command reminders ────────────────────────────────────────────────────
+    // Each platform on its own clock. A reminder is due once the interval has
+    // passed AND enough viewer lines have arrived since the last one — so it
+    // lands in a conversation, not an empty room, and a quiet chat is left alone.
+    const reminderEvery = Number.isFinite(cfg.reminderEveryMs) && cfg.reminderEveryMs > 0
+        ? Math.max(REMINDER_MIN_INTERVAL_MS, cfg.reminderEveryMs) : 0;
+    const reminderMin = Number.isFinite(cfg.reminderMinLines) ? Math.max(0, cfg.reminderMinLines) : DEFAULTS.reminderMinLines;
+    const reminderAt = { twitch: Date.now(), youtube: Date.now() };   // first one a full interval after start
+    const reminderLines = { twitch: 0, youtube: 0 };
+    let lastReminder = null;   // { at, platform, ok, reason } — on the status page
+
+    function checkReminders(now = Date.now()) {
+        const posted = [];
+        if (!live || !reminderEvery) return posted;
+        for (const platform of ['twitch', 'youtube']) {
+            if (!canAnswerOn(platform)) continue;
+            if (now - reminderAt[platform] < reminderEvery) continue;
+            if ((reminderLines[platform] || 0) < reminderMin) continue;
+            reminderAt[platform] = now;
+            reminderLines[platform] = 0;
+            if (platform === 'youtube' && youtubeQuota().left.messages <= REMINDER_YT_RESERVE) {
+                log(`reminder skipped on youtube — keeping the last ${REMINDER_YT_RESERVE} replies of today's quota for viewers who ask`);
+                lastReminder = { at: new Date(now).toISOString(), platform, ok: false, reason: 'quota reserve' };
+                continue;
+            }
+            posted.push(platform);
+            sayOn(platform, reminderText(platform, getGameSelection()))
+                .then(r => {
+                    const ok = !(r && r.ok === false);
+                    lastReminder = { at: new Date(now).toISOString(), platform, ok, reason: ok ? null : (r.reason || 'refused') };
+                    log(ok ? `reminder posted on ${platform}` : `reminder on ${platform} not delivered (${lastReminder.reason})`);
+                })
+                .catch(() => {});
+        }
+        return posted;
+    }
+    const reminderTimer = reminderEvery ? setInterval(() => { try { checkReminders(); } catch (e) { log(`reminder error (ignored): ${e && e.message}`); } }, 60000) : null;
+    reminderTimer?.unref?.();
+
     // Kill switch — flip without restarting the server mid-show.
     app.post('/api/chat-bridge/live/:state', (req, res) => {
         live = req.params.state === 'on';
@@ -912,14 +993,17 @@ export function initChatBridge(app, io, opts = {}) {
     // Named at start-up: a mistyped or empty CHAT_ADMINS turns !p1/!p2 off,
     // and silently would mean finding out mid-show.
     log(`admins: ${[...admins].join(', ') || 'NONE — !p1/!p2 are disabled'}`);
+    log(reminderEvery
+        ? `command reminders every ${reminderEvery / 60000} min, once ${reminderMin} viewer line(s) have come in`
+        : 'command reminders off');
     log(`live on #${channel} — cooldown ${cfg.cooldownMs}ms, dwell ${cfg.dwellMs}ms, slot ${CARD_SLOT}`);
     return {
         enabled: true,
-        stop() { for (const s of sources) s.conn.stop(); pending.shutdown(); clearTimeout(dwellTimer); clearTimeout(drainTimer); waiting.clear(); },
+        stop() { for (const s of sources) s.conn.stop(); pending.shutdown(); clearTimeout(dwellTimer); clearTimeout(drainTimer); clearInterval(reminderTimer); waiting.clear(); },
         addSource(name, conn) { sources.push({ name, conn }); },
         handle,
-        _test: { handle, parseCommand, status: () => ({ shownThisStream, lastShownAt }) },
+        _test: { handle, parseCommand, checkReminders, status: () => ({ shownThisStream, lastShownAt }) },
     };
 }
 
-export const _internal = { DEFAULTS, parseCommand, isDecklistsCommand, parsePlayerDeckCommand, plainText, shortLegend, describeMatch, ON_AIR, boardDeck, deckLink, deckTarget };
+export const _internal = { DEFAULTS, reminderText, parseCommand, isDecklistsCommand, parsePlayerDeckCommand, plainText, shortLegend, describeMatch, ON_AIR, boardDeck, deckLink, deckTarget };
